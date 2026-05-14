@@ -156,7 +156,16 @@
 	#endif
 
 	#define COM_COMPATIBLE	0
-	#define PLUGIN_API
+	/* winelib patch: under winegcc we want the VST3 COM call chain to use
+	 * Windows ms_abi calling convention so the host can call PE-side
+	 * plugin vtables directly without ABI bridging.  winegcc maps
+	 * `__stdcall` -> `__attribute__((ms_abi))`.  __WINE__ is defined by
+	 * winegcc; absent under native Linux. */
+	#if defined (__WINE__)
+		#define PLUGIN_API __stdcall
+	#else
+		#define PLUGIN_API
+	#endif
 	#define SMTG_PTHREADS	1
 
 	#define SMTG_EXPORT_SYMBOL __attribute__ ((visibility ("default")))
