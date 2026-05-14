@@ -36,6 +36,10 @@ namespace juce
 {
 
 //==============================================================================
+/* winelib patch: guard with #ifndef so prelude can pre-set.  Under winegcc
+ * the compiler forces -fshort-wchar (Windows ABI: wchar_t = 16-bit) even
+ * on a Linux-mode JUCE build. */
+#ifndef JUCE_NATIVE_WCHAR_IS_UTF8
 #if JUCE_WINDOWS
  /** @cond */
  #define JUCE_NATIVE_WCHAR_IS_UTF8      0
@@ -49,6 +53,7 @@ namespace juce
  #define JUCE_NATIVE_WCHAR_IS_UTF16     0
  /** This macro will be set to 1 if the compiler's native wchar_t is a 32-bit type. */
  #define JUCE_NATIVE_WCHAR_IS_UTF32     1
+#endif
 #endif
 
 #if JUCE_NATIVE_WCHAR_IS_UTF32 || DOXYGEN
