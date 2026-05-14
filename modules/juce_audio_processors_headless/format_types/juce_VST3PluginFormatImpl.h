@@ -1358,6 +1358,28 @@ private:
 
     static File getDLLFileFromBundle (const String& bundlePath)
     {
+       #if JUCE_VST3_WINELIB
+        /* Winelib: prefer Windows VST3 layouts so we can host PE
+         * plugins.  (1) Single-file .vst3 (e.g. u-he ACE(x64).vst3) —
+         * the .vst3 IS the DLL, return as-is.  (2) Bundle with
+         * `Contents/x86_64-win/<name>.vst3` — newer-format Windows
+         * VST3.  (3) Fall through to Linux bundle layout (existing
+         * behavior).  Order matters: many Windows plugins are
+         * single-file, so check that first. */
+        {
+            const File f { bundlePath };
+
+            if (f.existsAsFile())
+                return f;
+
+            const auto winBundle = f.getChildFile ("Contents")
+                                    .getChildFile ("x86_64-win")
+                                    .getChildFile (f.getFileNameWithoutExtension() + ".vst3");
+            if (winBundle.existsAsFile())
+                return winBundle;
+        }
+       #endif
+
        #if JUCE_LINUX || JUCE_BSD
         const auto machineName = []() -> String
         {
