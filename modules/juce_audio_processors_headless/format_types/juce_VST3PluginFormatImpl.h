@@ -1064,6 +1064,51 @@ struct DescriptionLister
 };
 
 //==============================================================================
+/* winelib patch: when building under winegcc (`__WINE__` defined) on Linux,
+ * detect Windows PE VST3 bundles and load them via Wine's `LoadLibraryW`
+ * instead of dlopen.  Same DLLHandle class — branches on the file's PE
+ * magic bytes.  fplatform.h's PLUGIN_API is already ms_abi under
+ * `__WINE__`, so the resulting IPluginFactory*'s vtable methods are
+ * callable directly. */
+#if JUCE_LINUX && defined (__WINE__)
+ #define JUCE_VST3_WINELIB 1
+#endif
+
+#if JUCE_VST3_WINELIB
+extern "C" {
+    /* Inline declarations — avoids pulling <windows.h>, which would
+     * collide with libstdc++ in JUCE_LINUX mode.  Note: WCHAR strings
+     * use `uint16_t*`, NOT `wchar_t*`, because winegcc's
+     * `-fno-short-wchar` (set by our toolchain) makes wchar_t 32-bit
+     * but Wine's PE side expects 16-bit WCHAR. */
+    void*       __stdcall LoadLibraryW   (const uint16_t* lpLibFileName);
+    void*       __stdcall GetProcAddress (void* hModule, const char* lpProcName);
+    int         __stdcall FreeLibrary    (void* hModule);
+}
+
+namespace {
+inline bool winelib_is_pe_file (const File& f)
+{
+    FileInputStream stream (f);
+    if (! stream.openedOk()) return false;
+    char magic[2] = { 0, 0 };
+    return stream.read (magic, 2) == 2 && magic[0] == 'M' && magic[1] == 'Z';
+}
+
+inline std::vector<uint16_t> winelib_path_to_utf16 (const String& path)
+{
+    /* ASCII-only conversion; sufficient for VST3 install paths under
+     * Wine.  Real UTF-8 → UTF-16 would need surrogate pair handling. */
+    std::vector<uint16_t> out;
+    auto* utf8 = path.toRawUTF8();
+    for (const char* p = utf8; *p != 0; ++p)
+        out.push_back (static_cast<uint16_t> (static_cast<unsigned char> (*p)));
+    out.push_back (0);
+    return out;
+}
+} // namespace
+#endif
+
 struct DLLHandle
 {
     explicit DLLHandle (const File& fileToOpen)
@@ -1081,6 +1126,20 @@ struct DLLHandle
             factory = nullptr;
 
             using ExitModuleFn = bool (PLUGIN_API*)();
+
+           #if JUCE_VST3_WINELIB
+            if (peHandle != nullptr)
+            {
+                /* Windows VST3 exit function is "ExitDll" (vs Linux
+                 * "ModuleExit").  Try ExitDll first when we're in PE
+                 * mode, then close the PE module. */
+                if (auto* exitFn = (ExitModuleFn) GetProcAddress (peHandle, "ExitDll"))
+                    exitFn();
+                FreeLibrary (peHandle);
+                peHandle = nullptr;
+                return;
+            }
+           #endif
 
             if (auto* exitFn = (ExitModuleFn) getFunction (exitFnName))
                 exitFn();
@@ -1107,6 +1166,11 @@ struct DLLHandle
 
     void* getFunction (const char* functionName)
     {
+       #if JUCE_VST3_WINELIB
+        if (peHandle != nullptr)
+            return GetProcAddress (peHandle, functionName);
+       #endif
+
        #if JUCE_WINDOWS || JUCE_LINUX || JUCE_BSD
         return library.getFunction (functionName);
        #elif JUCE_MAC
@@ -1143,12 +1207,50 @@ private:
     using EntryProc = bool (*) (CFBundleRef);
    #endif
 
+   #if JUCE_VST3_WINELIB
+    /* PE module handle (non-null when dllFile is a Windows VST3
+     * bundle loaded via Wine's LoadLibraryW).  Distinguishes the
+     * winelib PE path from the regular dlopen path. */
+    void* peHandle = nullptr;
+
+    using PEInitProc = bool (PLUGIN_API*)();
+    static constexpr const char* peEntryFnName = "InitDll";
+   #endif
+
     //==============================================================================
    #if JUCE_WINDOWS || JUCE_LINUX || JUCE_BSD
     DynamicLibrary library;
 
     bool open()
     {
+       #if JUCE_VST3_WINELIB
+        if (winelib_is_pe_file (dllFile))
+        {
+            /* Windows VST3 bundle — route through Wine's PE loader.
+             * Entry point is "InitDll()" (no args), vs Linux's
+             * "ModuleEntry(module_handle)". */
+            auto widePath = winelib_path_to_utf16 (dllFile.getFullPathName());
+            peHandle = LoadLibraryW (widePath.data());
+            if (peHandle != nullptr)
+            {
+                if (auto* proc = (PEInitProc) GetProcAddress (peHandle, peEntryFnName))
+                {
+                    if (proc())
+                        return true;
+                }
+                else
+                {
+                    // InitDll is optional per the VST3 spec
+                    return true;
+                }
+
+                FreeLibrary (peHandle);
+                peHandle = nullptr;
+            }
+            return false;
+        }
+       #endif
+
         if (library.open (dllFile.getFullPathName()))
         {
             if (auto* proc = (EntryProc) getFunction (entryFnName))

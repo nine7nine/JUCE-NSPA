@@ -155,15 +155,18 @@
 		#define BYTEORDER kBigEndian
 	#endif
 
-	#define COM_COMPATIBLE	0
-	/* winelib patch: under winegcc we want the VST3 COM call chain to use
-	 * Windows ms_abi calling convention so the host can call PE-side
-	 * plugin vtables directly without ABI bridging.  winegcc maps
-	 * `__stdcall` -> `__attribute__((ms_abi))`.  __WINE__ is defined by
-	 * winegcc; absent under native Linux. */
+	/* winelib patch: under winegcc we host Windows VST3 plugins in-process.
+	 * They were compiled with Windows ABI: ms_abi calling convention AND
+	 * COM_COMPATIBLE=1 (which controls Steinberg IID byte layout in
+	 * INLINE_UID).  Match that on the host side so JUCE's bundled SDK
+	 * generates IIDs and calls that align with what plugins expect.
+	 * winegcc maps `__stdcall` -> `__attribute__((ms_abi))`.
+	 * __WINE__ is defined by winegcc; absent on native Linux. */
 	#if defined (__WINE__)
+		#define COM_COMPATIBLE	1
 		#define PLUGIN_API __stdcall
 	#else
+		#define COM_COMPATIBLE	0
 		#define PLUGIN_API
 	#endif
 	#define SMTG_PTHREADS	1
