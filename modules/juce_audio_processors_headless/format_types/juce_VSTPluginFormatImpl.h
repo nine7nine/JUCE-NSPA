@@ -1364,14 +1364,21 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
             {
                 try
                 {
+                    JUCE_VST_LOG ("[winelib] before effIdentify");
                     winelib_vst2_abi::callDispatcher (newEffect, Vst2::effIdentify, 0, 0, nullptr, 0);
+                    JUCE_VST_LOG ("[winelib] before effSetSampleRate");
                     winelib_vst2_abi::callDispatcher (newEffect, Vst2::effSetSampleRate, 0, 0, nullptr, static_cast<float> (initialSampleRate));
+                    JUCE_VST_LOG ("[winelib] before effSetBlockSize");
                     winelib_vst2_abi::callDispatcher (newEffect, Vst2::effSetBlockSize,  0, blockSize, nullptr, 0);
+                    JUCE_VST_LOG ("[winelib] before effOpen");
                     winelib_vst2_abi::callDispatcher (newEffect, Vst2::effOpen, 0, 0, nullptr, 0);
+                    JUCE_VST_LOG ("[winelib] before queryBusIO");
                     ioConfig = queryBusIO (newEffect);
+                    JUCE_VST_LOG ("[winelib] init complete");
                 }
                 catch (...)
                 {
+                    JUCE_VST_LOG ("[winelib] init threw exception");
                     // Plugin init threw — leave newEffect partially
                     // initialised but contained; the host will either
                     // log a "failed to initialise" and discard, or
@@ -1953,6 +1960,8 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
                                                                                  void* ptr,
                                                                                  float opt)
     {
+        JUCE_VST_LOG ("[winelib] audioMaster: opcode=" + String ((int) opcode)
+                       + " eff=" + String::toHexString ((pointer_sized_int) eff));
         if (eff != nullptr)
             if (auto* instance = (VSTPluginInstanceHeadless*) (eff->resvd2))
                 return instance->handleCallback (opcode, index, value, ptr, opt);
@@ -2021,7 +2030,18 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
                  *
                  * Dispatcher is called via winelib_vst2_abi::callDispatcher
                  * which reinterpret_casts the slot to an ms_abi-typed
-                 * pointer — see helpers at the top of this file. */
+                 * pointer — see helpers at the top of this file.
+                 *
+                 * BOTH branches (with-worker AND fallback) MUST use
+                 * callDispatcher.  The wineDispatcher is set on the
+                 * instance AFTER std::make_unique returns from
+                 * create(); the constructor's refreshParameterList
+                 * runs while wineDispatcher is still null, so the
+                 * else branch fires during init — and a direct
+                 * `vstEffect->dispatcher(...)` there would use System V
+                 * ABI on a PE function pointer, killing the process
+                 * the moment the constructor tries to enumerate
+                 * parameters via effCanBeAutomated. */
                 if (wineDispatcher != nullptr)
                 {
                     wineDispatcher->run ([&]
@@ -2030,10 +2050,14 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
                     });
                 }
                 else
-               #endif
+                {
+                    result = winelib_vst2_abi::callDispatcher (vstEffect, opcode, index, value, ptr, opt);
+                }
+               #else
                 {
                     result = vstEffect->dispatcher (vstEffect, opcode, index, value, ptr, opt);
                 }
+               #endif
 
                #if JUCE_MAC
                 auto newResFile = CurResFile();
@@ -2434,7 +2458,9 @@ private:
              * with.  See winelib_vst2_abi (top of file) for the
              * background. */
             winelib_vst2_abi::AudioMasterMS audioMaster = &VSTPluginInstanceHeadless::audioMasterCallbackThunk;
+            JUCE_VST_LOG ("[winelib] before callMain (moduleMain=" + String::toHexString ((pointer_sized_int) module->moduleMain) + ")");
             effect = winelib_vst2_abi::callMain (module->moduleMain, audioMaster);
+            JUCE_VST_LOG ("[winelib] after callMain  -> effect=" + String::toHexString ((pointer_sized_int) effect));
            #else
             constexpr Vst2::audioMasterCallback audioMaster = [] (Vst2::AEffect* eff,
                                                                   Vst2::VstInt32 opcode,
