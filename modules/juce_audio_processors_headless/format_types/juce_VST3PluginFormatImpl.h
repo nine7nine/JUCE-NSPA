@@ -1075,6 +1075,14 @@ struct DescriptionLister
 #endif
 
 #if JUCE_VST3_WINELIB
+// Vendored librtpi + thin C++ RAII over pi_mutex_t / pi_cond_t.
+// The dispatcher below uses PiMutex + PiCond instead of std::mutex +
+// std::condition_variable so the JACK callback (priority-inherited
+// from SCHED_FIFO@80) can never lose its PI chain to a lower-prio
+// thread holding the dispatcher's lock.  See header for full
+// rationale.
+#include "juce_winelib_pi_sync.h"
+
 extern "C" {
     /* Inline declarations — avoids pulling <windows.h>, which would
      * collide with libstdc++ in JUCE_LINUX mode.  Note: WCHAR strings
@@ -1103,12 +1111,14 @@ extern "C" {
 // by VST3ComponentHolder (declared first among its members so it
 // outlives every other plugin-touching field through teardown).
 // JUCE pthreads marshal plugin lifecycle + audio calls to the instance's
-// worker through a std::mutex+condvar request/done pair (pthread today;
-// pi_mutex_t/pi_cond_t librtpi swap planned for a future RT pass — see
-// project_winelib_juce_librtpi_direct_phase3_preferred memo).  The worker
-// runs plugin code in proper Win32 context.  Synchronous dispatch — caller
-// blocks until the worker finishes.  No queue depth > 1 (we always wait
-// for completion).
+// worker through a PiMutex + paired PiCond request/done pair from
+// juce_winelib_pi_sync.h (vendored librtpi — pi_mutex_t / pi_cond_t with
+// PI inheritance and FUTEX_*_REQUEUE_PI for atomic wake-and-reacquire).
+// The JACK callback at SCHED_FIFO@80 can therefore boost a lower-prio
+// caller holding the dispatcher's lock instead of being inverted on it.
+// The worker runs plugin code in proper Win32 context.  Synchronous
+// dispatch — caller blocks until the worker finishes.  No queue depth
+// > 1 (we always wait for completion).
 //
 // One global dispatcher (globalWineDispatcher() below) still exists — used
 // EXCLUSIVELY for the one-time LoadLibraryW per DLL.  DllMain runs once
@@ -1168,9 +1178,9 @@ public:
     ~WineWin32Dispatcher()
     {
         {
-            std::lock_guard<std::mutex> lk (mtx);
+            std::lock_guard<PiMutex> lk (mtx);
             shutdown = true;
-            cvRequest.notify_all();
+            cvRequest.broadcast (mtx);
         }
         if (workerThread != nullptr)
         {
@@ -1208,11 +1218,12 @@ public:
             fn();
             return;
         }
-        std::unique_lock<std::mutex> lk (mtx);
+        std::unique_lock<PiMutex> lk (mtx);
         currentTask = std::move (fn);
         taskPending = true;
-        cvRequest.notify_one();
-        cvDone.wait (lk, [this] { return ! taskPending; });
+        cvRequest.signal (mtx);
+        while (taskPending)
+            cvDone.wait (mtx);
     }
 
 private:
@@ -1253,8 +1264,9 @@ private:
         {
             std::function<void()> task;
             {
-                std::unique_lock<std::mutex> lk (mtx);
-                cvRequest.wait (lk, [this] { return taskPending || shutdown; });
+                std::unique_lock<PiMutex> lk (mtx);
+                while (! taskPending && ! shutdown)
+                    cvRequest.wait (mtx);
                 if (shutdown && ! taskPending)
                     return;
                 task = std::move (currentTask);
@@ -1263,18 +1275,18 @@ private:
             task();
 
             {
-                std::lock_guard<std::mutex> lk (mtx);
+                std::lock_guard<PiMutex> lk (mtx);
                 taskPending = false;
-                cvDone.notify_one();
+                cvDone.signal (mtx);
             }
         }
     }
 
     WineHANDLE             workerThread = nullptr;
     std::thread::id        workerThreadId{};
-    std::mutex             mtx;
-    std::condition_variable cvRequest;
-    std::condition_variable cvDone;
+    PiMutex                mtx;
+    PiCond                 cvRequest;
+    PiCond                 cvDone;
     std::function<void()>  currentTask;
     bool                   taskPending = false;
     bool                   shutdown    = false;
@@ -3182,10 +3194,11 @@ public:
          * so the plugin sees the same thread identity here as it did
          * during init/setActive.  Worker is per-instance, so N JACK-
          * callback-driven process() calls across N instances run on N
-         * parallel workers (no global bottleneck).  The dispatch
-         * round-trip is currently two pthread futex hops; planned librtpi
-         * (pi_cond_t/pi_mutex_t) swap will lower that and add priority
-         * inheritance — see librtpi-direct memo. */
+         * parallel workers (no global bottleneck).  Round-trip is two
+         * FUTEX_*_PI hops on a PiMutex + PiCond pair (vendored librtpi):
+         * the JACK thread's PI chain carries through the worker for the
+         * duration of process(), so no inversion gap exists between
+         * dispatch and wake. */
         holder->wineDispatcher.run ([&] { processor->process (data); });
        #else
         processor->process (data);
