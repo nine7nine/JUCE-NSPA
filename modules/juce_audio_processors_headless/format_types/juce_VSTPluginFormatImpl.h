@@ -110,6 +110,80 @@ namespace juce
 #if JUCE_VST2_WINELIB
 #include "juce_winelib_path.h"
 #include "juce_winelib_dispatch.h"
+
+/* ms_abi call-boundary helpers for VST2 winelib hosting.
+ *
+ * The Steinberg VST2 SDK defines `VSTCALLBACK` as empty under
+ * `__GNUC__` (commented-out __cdecl), so JUCE's typedefs for
+ * `audioMasterCallback`, `AEffectDispatcherProc`,
+ * `AEffectProcessReplacingProc`, etc. all carry the default System V
+ * calling convention on x86_64.  Windows PE VST2 DLLs were compiled
+ * with `VSTCALLBACK = __cdecl`, which on x86_64 is the Microsoft x64
+ * ABI.  Direct function-pointer calls between System V and MS x64
+ * shuffle args through different registers (rdi/rsi/rdx/rcx vs
+ * rcx/rdx/r8/r9) — plugin sees garbage and either returns nullptr
+ * from moduleMain or fails internal sanity checks during effOpen.
+ *
+ * We can't extend Steinberg's SDK headers (license + system-package
+ * file) and we can't redefine VSTCALLBACK before include (the SDK
+ * sets it unconditionally under __GNUC__).  So instead we reinterpret
+ * the PE-origin function pointers as ms_abi-typed pointers at each
+ * call site.  The cast is safe because the underlying machine code
+ * really is ms_abi — we're only correcting the type C++ sees.
+ *
+ * Yabridge solves the same problem via vestige's VST_CALL_CONV macro
+ * which under __WINE__ resolves to winegcc's __cdecl (= ms_abi); we
+ * can't take that path because the JUCE-as-host build needs the full
+ * Steinberg surface (ERect, effVendorSpecific, kVstTransportRecording,
+ * etc.) that vestige lacks.  See feedback_vestige_cleanroom_no_extend.
+ */
+/* Already inside `namespace juce` (impl.h opens it at line ~93 below
+ * us in this file) when this header included from
+ * juce_VSTPluginFormatHeadless.cpp / juce_VSTPluginFormat.cpp.
+ * Don't re-wrap or we get juce::juce::winelib_vst2_abi. */
+namespace winelib_vst2_abi
+{
+    using DispatcherMS         = pointer_sized_int __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, Vst2::VstInt32, Vst2::VstInt32, Vst2::VstIntPtr, void*, float);
+    using ProcessReplacingMS   = void              __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, float**, float**, Vst2::VstInt32);
+    using ProcessDoubleMS      = void              __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, double**, double**, Vst2::VstInt32);
+    using ProcessLegacyMS      = void              __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, float**, float**, Vst2::VstInt32);
+    using AudioMasterMS        = Vst2::VstIntPtr   __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, Vst2::VstInt32, Vst2::VstInt32, Vst2::VstIntPtr, void*, float);
+    using VstMainMS            = Vst2::AEffect*    __attribute__((__ms_abi__)) (*) (AudioMasterMS);
+
+    // Inline call helpers — cast the System-V-typed function pointer
+    // we have to the matching ms_abi-typed pointer, then invoke.  The
+    // cast is purely a type fix; the underlying machine code is
+    // already ms_abi (it came from a Windows PE DLL).
+    inline pointer_sized_int callDispatcher (Vst2::AEffect* e, Vst2::VstInt32 op, Vst2::VstInt32 idx, Vst2::VstIntPtr val, void* ptr, float opt)
+    {
+        return reinterpret_cast<DispatcherMS> (e->dispatcher) (e, op, idx, val, ptr, opt);
+    }
+
+    inline void callProcessReplacing (Vst2::AEffect* e, float** in, float** out, Vst2::VstInt32 numFrames)
+    {
+        reinterpret_cast<ProcessReplacingMS> (e->processReplacing) (e, in, out, numFrames);
+    }
+
+    inline void callProcessDoubleReplacing (Vst2::AEffect* e, double** in, double** out, Vst2::VstInt32 numFrames)
+    {
+        reinterpret_cast<ProcessDoubleMS> (e->processDoubleReplacing) (e, in, out, numFrames);
+    }
+
+    inline void callProcessLegacy (Vst2::AEffect* e, float** in, float** out, Vst2::VstInt32 numFrames)
+    {
+        reinterpret_cast<ProcessLegacyMS> (e->process) (e, in, out, numFrames);
+    }
+
+    inline Vst2::AEffect* callMain (Vst2::AEffect* (*mainFn) (Vst2::audioMasterCallback), AudioMasterMS audioMaster)
+    {
+        // mainFn was obtained via GetProcAddress on a PE DLL — the
+        // pointer's machine code is ms_abi.  audioMaster is our
+        // ms_abi-attributed thunk — passing it through under the
+        // AudioMasterMS typedef preserves the attribute.
+        auto wineMain = reinterpret_cast<VstMainMS> (mainFn);
+        return wineMain (audioMaster);
+    }
+}
 #endif
 
 //==============================================================================
@@ -1237,7 +1311,7 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
             {
                 wineDispatcher->run ([&]
                 {
-                    vstEffect->dispatcher (vstEffect, Vst2::effClose, 0, 0, nullptr, 0);
+                    winelib_vst2_abi::callDispatcher (vstEffect, Vst2::effClose, 0, 0, nullptr, 0);
                 });
             }
             else
@@ -1284,10 +1358,10 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
             BusesProperties ioConfig;
             wineDisp->run ([&]
             {
-                newEffect->dispatcher (newEffect, Vst2::effIdentify, 0, 0, nullptr, 0);
-                newEffect->dispatcher (newEffect, Vst2::effSetSampleRate, 0, 0, nullptr, static_cast<float> (initialSampleRate));
-                newEffect->dispatcher (newEffect, Vst2::effSetBlockSize,  0, blockSize, nullptr, 0);
-                newEffect->dispatcher (newEffect, Vst2::effOpen, 0, 0, nullptr, 0);
+                winelib_vst2_abi::callDispatcher (newEffect, Vst2::effIdentify, 0, 0, nullptr, 0);
+                winelib_vst2_abi::callDispatcher (newEffect, Vst2::effSetSampleRate, 0, 0, nullptr, static_cast<float> (initialSampleRate));
+                winelib_vst2_abi::callDispatcher (newEffect, Vst2::effSetBlockSize,  0, blockSize, nullptr, 0);
+                winelib_vst2_abi::callDispatcher (newEffect, Vst2::effOpen, 0, 0, nullptr, 0);
                 ioConfig = queryBusIO (newEffect);
             });
 
@@ -1846,6 +1920,32 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
         return 0;
     }
 
+   #if JUCE_VST2_WINELIB
+    /* ms_abi-attributed audioMaster thunk for Windows PE VST2 plugins.
+     * Plugin's code is compiled with the Steinberg SDK where
+     * audioMasterCallback has VSTCALLBACK = __cdecl (= ms_abi on
+     * x86_64); plugin calls back into us through that typedef using
+     * ms_abi.  A C++ lambda's call operator carries the default
+     * System V calling convention and can't reliably carry
+     * __attribute__((__ms_abi__)) — this static member function can.
+     * We hand its address to the plugin's moduleMain via the
+     * AudioMasterMS-typed slot in winelib_vst2_abi::callMain.  Body
+     * is identical to the non-winelib lambda in constructEffect. */
+    static __attribute__((__ms_abi__)) Vst2::VstIntPtr audioMasterCallbackThunk (Vst2::AEffect* eff,
+                                                                                 Vst2::VstInt32 opcode,
+                                                                                 Vst2::VstInt32 index,
+                                                                                 Vst2::VstIntPtr value,
+                                                                                 void* ptr,
+                                                                                 float opt)
+    {
+        if (eff != nullptr)
+            if (auto* instance = (VSTPluginInstanceHeadless*) (eff->resvd2))
+                return instance->handleCallback (opcode, index, value, ptr, opt);
+
+        return VSTPluginInstanceHeadless::handleGeneralCallback (opcode, index, value, ptr, opt);
+    }
+   #endif
+
     // handles non plugin-specific callbacks
     static pointer_sized_int handleGeneralCallback (int32 opcode, int32 /*index*/, pointer_sized_int /*value*/, void* ptr, float /*opt*/)
     {
@@ -1902,12 +2002,16 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
                  * ExitProcess assertions.  Self-dispatch guard inside
                  * `run()` lets the host callback chain (which lands
                  * back here from inside a plugin call) execute inline
-                 * on the worker without re-queueing. */
+                 * on the worker without re-queueing.
+                 *
+                 * Dispatcher is called via winelib_vst2_abi::callDispatcher
+                 * which reinterpret_casts the slot to an ms_abi-typed
+                 * pointer — see helpers at the top of this file. */
                 if (wineDispatcher != nullptr)
                 {
                     wineDispatcher->run ([&]
                     {
-                        result = vstEffect->dispatcher (vstEffect, opcode, index, value, ptr, opt);
+                        result = winelib_vst2_abi::callDispatcher (vstEffect, opcode, index, value, ptr, opt);
                     });
                 }
                 else
@@ -2308,6 +2412,15 @@ private:
                 UseResFile (module->resFileId);
            #endif
 
+           #if JUCE_VST2_WINELIB
+            /* Use the ms_abi-attributed static thunk and call the
+             * plugin's moduleMain via the ms_abi-typed wrapper —
+             * matches the calling convention the PE DLL was compiled
+             * with.  See winelib_vst2_abi (top of file) for the
+             * background. */
+            winelib_vst2_abi::AudioMasterMS audioMaster = &VSTPluginInstanceHeadless::audioMasterCallbackThunk;
+            effect = winelib_vst2_abi::callMain (module->moduleMain, audioMaster);
+           #else
             constexpr Vst2::audioMasterCallback audioMaster = [] (Vst2::AEffect* eff,
                                                                   Vst2::VstInt32 opcode,
                                                                   Vst2::VstInt32 index,
@@ -2325,6 +2438,7 @@ private:
             {
                 JUCE_VST_WRAPPER_INVOKE_MAIN
             }
+           #endif
 
             if (effect != nullptr && effect->magic == 0x56737450 /* 'VstP' */)
             {
@@ -2362,8 +2476,13 @@ private:
             SpeakerMappings::VstSpeakerConfigurationHolder canonicalIn  (AudioChannelSet::canonicalChannelSet (effect->numInputs));
             SpeakerMappings::VstSpeakerConfigurationHolder canonicalOut (AudioChannelSet::canonicalChannelSet (effect->numOutputs));
 
+           #if JUCE_VST2_WINELIB
+            winelib_vst2_abi::callDispatcher (effect, Vst2::effSetSpeakerArrangement, 0,
+                                              (pointer_sized_int) &canonicalIn.get(), (void*) &canonicalOut.get(), 0.0f);
+           #else
             effect->dispatcher (effect, Vst2::effSetSpeakerArrangement, 0,
                                       (pointer_sized_int) &canonicalIn.get(), (void*) &canonicalOut.get(), 0.0f);
+           #endif
         }
 
         const auto arrangement = getSpeakerArrangementWrapper (effect);
@@ -2381,8 +2500,13 @@ private:
 
             for (int ch = 0; ch < maxChannels; ch += layout.size())
             {
+               #if JUCE_VST2_WINELIB
+                if (winelib_vst2_abi::callDispatcher (effect, opcode, ch, 0, &pinProps, 0.0f) == 0)
+                    break;
+               #else
                 if (effect->dispatcher (effect, opcode, ch, 0, &pinProps, 0.0f) == 0)
                     break;
+               #endif
 
                 if ((pinProps.flags & Vst2::kVstPinUseSpeaker) != 0)
                 {
@@ -2407,8 +2531,13 @@ private:
             {
                 String busName = (isInput ? "Input" : "Output");
 
+               #if JUCE_VST2_WINELIB
+                if (winelib_vst2_abi::callDispatcher (effect, opcode, 0, 0, &pinProps, 0.0f) != 0)
+                    busName = pinProps.label;
+               #else
                 if (effect->dispatcher (effect, opcode, 0, 0, &pinProps, 0.0f) != 0)
                     busName = pinProps.label;
+               #endif
 
                 if (arr != nullptr)
                     layout = SpeakerMappings::vstArrangementTypeToChannelSet (*arr);
@@ -2439,8 +2568,13 @@ private:
             {
                 Vst2::VstPinProperties pinProps;
 
+               #if JUCE_VST2_WINELIB
+                if (winelib_vst2_abi::callDispatcher (effect, opcode, ch, 0, &pinProps, 0.0f) == 0)
+                    return false;
+               #else
                 if (effect->dispatcher (effect, opcode, ch, 0, &pinProps, 0.0f) == 0)
                     return false;
+               #endif
 
                 if ((pinProps.flags & Vst2::kVstPinUseSpeaker) != 0)
                     return true;
@@ -2470,12 +2604,21 @@ private:
             return { nullptr, nullptr };
 
         SpeakerArrangements result { nullptr, nullptr };
+       #if JUCE_VST2_WINELIB
+        const auto dispatchResult = winelib_vst2_abi::callDispatcher (effect,
+                                                                       Vst2::effGetSpeakerArrangement,
+                                                                       0,
+                                                                       reinterpret_cast<pointer_sized_int> (&result.in),
+                                                                       &result.out,
+                                                                       0.0f);
+       #else
         const auto dispatchResult = effect->dispatcher (effect,
                                                         Vst2::effGetSpeakerArrangement,
                                                         0,
                                                         reinterpret_cast<pointer_sized_int> (&result.in),
                                                         &result.out,
                                                         0.0f);
+       #endif
 
         if (dispatchResult != 0)
             return result;
@@ -2609,13 +2752,14 @@ private:
                #if JUCE_VST2_WINELIB
                 /* effProcessEvents is a plugin call invoked on the
                  * audio thread just before processReplacing.  Same
-                 * thread-identity rule applies — route through the
-                 * per-instance worker. */
+                 * thread-identity + ABI rules apply — route through
+                 * the per-instance worker AND through the ms_abi
+                 * callDispatcher helper. */
                 if (wineDispatcher != nullptr)
                 {
                     wineDispatcher->run ([&]
                     {
-                        vstEffect->dispatcher (vstEffect, Vst2::effProcessEvents, 0, 0, midiEventsToSend.events, 0);
+                        winelib_vst2_abi::callDispatcher (vstEffect, Vst2::effProcessEvents, 0, 0, midiEventsToSend.events, 0);
                     });
                 }
                 else
@@ -2685,16 +2829,20 @@ private:
             {
                 if ((vstEffect->flags & Vst2::effFlagsCanReplacing) != 0)
                 {
-                    vstEffect->processReplacing (vstEffect, tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
-                                                            tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer), sampleFrames);
+                    winelib_vst2_abi::callProcessReplacing (vstEffect,
+                                                            tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                            tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer),
+                                                            sampleFrames);
                 }
                 else
                 {
                     outOfPlaceBuffer.setSize (vstEffect->numOutputs, sampleFrames);
                     outOfPlaceBuffer.clear();
 
-                    vstEffect->process (vstEffect, tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
-                                                   tempChannelPointers[1].getArrayOfModifiableWritePointers (outOfPlaceBuffer), sampleFrames);
+                    winelib_vst2_abi::callProcessLegacy (vstEffect,
+                                                         tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                         tempChannelPointers[1].getArrayOfModifiableWritePointers (outOfPlaceBuffer),
+                                                         sampleFrames);
 
                     for (int i = vstEffect->numOutputs; --i >= 0;)
                         buffer.copyFrom (i, 0, outOfPlaceBuffer.getReadPointer (i), sampleFrames);
@@ -2729,8 +2877,10 @@ private:
         {
             wineDispatcher->run ([&]
             {
-                vstEffect->processDoubleReplacing (vstEffect, tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
-                                                              tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer), sampleFrames);
+                winelib_vst2_abi::callProcessDoubleReplacing (vstEffect,
+                                                              tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                              tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer),
+                                                              sampleFrames);
             });
             return;
         }
