@@ -195,6 +195,10 @@
  #include <juce_gui_basics/native/juce_ScopedWindowAssociation_linux.h>
  #include "native/juce_XEmbedComponent_linux.cpp"
 
+ #if defined (__WINE__)
+  #include "native/juce_WineHWNDEmbedComponent_linux.cpp"
+ #endif
+
  #if JUCE_WEB_BROWSER
   #if JUCE_USE_EXTERNAL_TEMPORARY_SUBPROCESS
    #include "juce_LinuxSubprocessHelperBinaryData.h"

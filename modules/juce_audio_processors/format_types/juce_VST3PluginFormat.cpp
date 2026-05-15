@@ -463,6 +463,10 @@ private:
         {
             #if JUCE_WINDOWS
              pluginHandle = static_cast<HWND> (embeddedComponent.getHWND());
+            #elif defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
+             // winelib host: take the HWND immediately; X11 reparenting
+             // happens when the component is added to a peer below.
+             pluginHandle = (HandleFormat) embeddedComponent.getHWND();
             #endif
 
              embeddedComponent.setBounds (getLocalBounds());
@@ -470,7 +474,7 @@ private:
 
             #if JUCE_MAC
              pluginHandle = (HandleFormat) embeddedComponent.getView();
-            #elif JUCE_LINUX || JUCE_BSD
+            #elif (JUCE_LINUX || JUCE_BSD) && ! defined (__WINE__)
              pluginHandle = (HandleFormat) embeddedComponent.getHostWindowID();
             #endif
 
@@ -562,6 +566,14 @@ private:
    #elif JUCE_MAC
     NSViewComponentWithParent embeddedComponent;
     using HandleFormat = NSView*;
+   #elif defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
+    // winelib host: present a real HWND to the plugin.
+    // WineHWNDEmbedComponent reparents its X11 backing window under
+    // JUCE's peer when added to a desktop.  HandleFormat is void* (HWND)
+    // to keep this header free of <windows.h>; the cast to/from
+    // pluginHandle is unchanged.
+    WineHWNDEmbedComponent embeddedComponent;
+    using HandleFormat = void*;
    #elif JUCE_LINUX || JUCE_BSD
     XEmbedComponent embeddedComponent { true, false };
     using HandleFormat = Window;
@@ -594,6 +606,8 @@ private:
                    #if JUCE_WINDOWS
                     r->embeddedComponent.updateHWNDBounds();
                    #elif JUCE_LINUX || JUCE_BSD
+                    // WineHWNDEmbedComponent and XEmbedComponent both
+                    // expose updateEmbeddedBounds() with the same signature.
                     r->embeddedComponent.updateEmbeddedBounds();
                    #endif
                 }

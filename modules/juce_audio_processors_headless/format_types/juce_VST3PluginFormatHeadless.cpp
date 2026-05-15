@@ -161,6 +161,31 @@ FileSearchPath VST3PluginFormatHeadless::getDefaultLocationsToSearch()
     return FileSearchPath (localAppData + "\\Programs\\Common\\VST3;" + programFiles + "\\Common Files\\VST3");
    #elif JUCE_MAC
     return FileSearchPath ("~/Library/Audio/Plug-Ins/VST3;/Library/Audio/Plug-Ins/VST3");
+   #elif defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
+    // Winelib host: Windows-side defaults under the Wine prefix.
+    //
+    // We're a winelib ELF compiled in JUCE_LINUX mode (the JUCE-as-Linux
+    // pivot from winelib_compat.h), but the plugins this host can load
+    // via LoadLibraryW (Phase 2 PE pipeline) live inside the Wine prefix's
+    // drive_c tree, not in the Linux ~/.vst3 / /usr/lib/vst3 tree.
+    //
+    // Returning the Linux defaults here pulls in yabridge-wrapped bundles
+    // and other host-incompatible artifacts that crash in-process under
+    // direct Wine LoadLibraryW.  Instead, derive Windows-style VST3 paths
+    // from the WINEPREFIX env var (always set for winelib runtimes).
+    //
+    // If WINEPREFIX is unset (shouldn't happen under our runtime), return
+    // an empty path — the user must add a path manually via Element.conf.
+    if (const char* prefix = getenv ("WINEPREFIX"))
+    {
+        const String p (prefix);
+        const char* userEnv = getenv ("USER");
+        const String user (userEnv != nullptr ? userEnv : "");
+        return FileSearchPath (p + "/drive_c/Program Files/Common Files/VST3;"
+                             + p + "/drive_c/users/" + user
+                             + "/AppData/Local/Programs/Common/VST3");
+    }
+    return FileSearchPath();
    #else
     return FileSearchPath ("~/.vst3/;/usr/lib/vst3/;/usr/local/lib/vst3/");
    #endif

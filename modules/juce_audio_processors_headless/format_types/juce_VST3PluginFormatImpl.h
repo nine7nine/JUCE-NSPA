@@ -1087,12 +1087,256 @@ extern "C" {
 }
 
 namespace {
+//==============================================================================
+// Winelib Win32 thread dispatcher — see yabridge/src/wine-host/utils.h
+// (Win32Thread class) for the motivation: when a winelib ELF (compiled in
+// JUCE_LINUX mode) calls into Win32 PE plugin code, every call must
+// originate from a thread created by Win32 CreateThread, NOT a JUCE-
+// promoted pthread.  pthreads don't have the per-thread Win32 TEB / TLS
+// / COM-apartment state that Win32 PE libraries assume.  When plugin
+// code does TLS lookups, COM apartment checks, or thread-local
+// allocations against missing state, it eventually hits an unrecoverable
+// condition and calls ExitProcess() — which is exactly the death pattern
+// our diagnostics caught (LdrShutdownProcess from inside the plugin
+// without any prior signal / abort / C++ exception).
+//
+// Solution: one dedicated Win32 worker thread per VST3PluginInstance.
+// JUCE pthreads marshal plugin lifecycle calls to the worker through a
+// std::mutex+condvar request/done pair.  The worker runs plugin code in
+// proper Win32 context.  Synchronous dispatch — caller blocks until the
+// worker finishes.  No queue depth > 1 (we always wait for completion).
+//
+// Win32 API forward decls (Phase 2 pattern — avoid pulling <windows.h>
+// in our JUCE_LINUX-mode TU).  On x86_64 winelib `__stdcall` resolves to
+// `__attribute__((__ms_abi__))`, matching Wine's PE-side calling
+// convention.
+
+extern "C" {
+    using WineHANDLE   = void*;
+    using WineDWORD    = uint32_t;
+    using WineBOOL     = int;
+    using WineThreadFunc = WineDWORD (__stdcall*) (void* param);
+
+    WineHANDLE __stdcall CreateThread        (void*           securityAttrs,
+                                              size_t          stackSize,
+                                              WineThreadFunc  startRoutine,
+                                              void*           param,
+                                              WineDWORD       creationFlags,
+                                              WineDWORD*      outThreadId);
+    WineDWORD  __stdcall WaitForSingleObject (WineHANDLE handle, WineDWORD ms);
+    WineBOOL   __stdcall CloseHandle         (WineHANDLE handle);
+    int        __stdcall OleInitialize       (void* reserved);
+    void       __stdcall OleUninitialize     (void);
+}
+
+constexpr WineDWORD WINELIB_INFINITE = 0xFFFFFFFFu;
+
+class WineWin32Dispatcher
+{
+public:
+    WineWin32Dispatcher()
+    {
+        workerThread = CreateThread (nullptr, 0, &workerEntry, this, 0, nullptr);
+    }
+
+    ~WineWin32Dispatcher()
+    {
+        {
+            std::lock_guard<std::mutex> lk (mtx);
+            shutdown = true;
+            cvRequest.notify_all();
+        }
+        if (workerThread != nullptr)
+        {
+            WaitForSingleObject (workerThread, WINELIB_INFINITE);
+            CloseHandle (workerThread);
+            workerThread = nullptr;
+        }
+    }
+
+    WineWin32Dispatcher (const WineWin32Dispatcher&)            = delete;
+    WineWin32Dispatcher& operator= (const WineWin32Dispatcher&) = delete;
+
+    /** Run `fn` on the Win32 worker thread, block until complete.
+        Caller's return value (if any) should be captured by reference
+        inside the lambda — e.g.
+            tresult r;
+            dispatcher.run ([&] { r = plugin->setActive (true); });
+    */
+    void run (std::function<void()> fn)
+    {
+        if (workerThread == nullptr)
+        {
+            // Fallback if CreateThread failed (shouldn't happen).
+            fn();
+            return;
+        }
+        std::unique_lock<std::mutex> lk (mtx);
+        currentTask = std::move (fn);
+        taskPending = true;
+        cvRequest.notify_one();
+        cvDone.wait (lk, [this] { return ! taskPending; });
+    }
+
+private:
+    static WineDWORD __stdcall workerEntry (void* selfPtr)
+    {
+        // Initialize OLE on the worker thread itself.  Without this,
+        // plugin's internal COM/RPC marshalling (which u-he plugins use
+        // for AM_Message dispatch internally) falls back to whichever
+        // OTHER thread happens to have OleInitialize'd state — usually
+        // Element's main thread (pthread, incomplete TEB), tripping the
+        // ExitProcess path.  Mirror of yabridge's host.cpp:112 but on
+        // the worker thread instead of the host main.
+        OleInitialize (nullptr);
+        static_cast<WineWin32Dispatcher*> (selfPtr)->workerLoop();
+        OleUninitialize();
+        return 0;
+    }
+
+    void workerLoop()
+    {
+        while (true)
+        {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lk (mtx);
+                cvRequest.wait (lk, [this] { return taskPending || shutdown; });
+                if (shutdown && ! taskPending)
+                    return;
+                task = std::move (currentTask);
+            }
+
+            task();
+
+            {
+                std::lock_guard<std::mutex> lk (mtx);
+                taskPending = false;
+                cvDone.notify_one();
+            }
+        }
+    }
+
+    WineHANDLE             workerThread = nullptr;
+    std::mutex             mtx;
+    std::condition_variable cvRequest;
+    std::condition_variable cvDone;
+    std::function<void()>  currentTask;
+    bool                   taskPending = false;
+    bool                   shutdown    = false;
+};
+
+/* Global Win32 dispatcher — single worker thread serving ALL plugin
+ * operations (DLL load, factory createInstance, lifecycle, audio).
+ *
+ * Per-instance dispatchers fail because the plugin's DllMain and early
+ * state setup happen on whichever thread first calls LoadLibraryW —
+ * usually JUCE's message thread (pthread, incomplete TEB).  Later
+ * lifecycle calls on the per-instance Win32 worker thread can't find
+ * the TEB-local state plugin set up on the pthread, and the plugin
+ * eventually calls ExitProcess().
+ *
+ * Routing every plugin-touching call through ONE Win32 worker means
+ * the plugin's DllMain runs on a proper Win32 thread, all state setup
+ * lives on that thread, all later calls find that state.  Single
+ * point of serialization for plugin operations (acceptable — these
+ * calls aren't on the RT audio hot path; audio dispatch can be a
+ * separate per-instance worker later).
+ */
+inline WineWin32Dispatcher& globalWineDispatcher()
+{
+    static WineWin32Dispatcher instance;
+    return instance;
+}
+
+/* Convert a Linux filesystem path to a Wine DOS path (e.g. "C:\\...")
+ * BEFORE LoadLibraryW.  Without this, Wine stores the raw NT-namespace
+ * "\\?\\unix\\<host-path>" as the module's FullDllName.  Plugins that
+ * introspect their location via GetModuleFileNameW() (u-he VST3s in
+ * particular) can't parse that, log "ERROR: Could not find binary
+ * path", and crash downstream when they try to load related resources
+ * (preset banks, midi-assign tables, etc.) relative to their binary.
+ *
+ * Ported from yabridge's src/wine-host/utils.cpp::to_dos_path()
+ * (Robbert van der Helm, GPL-3).  We use only the manual-dosdevices
+ * fallback path because Wine's `wine_get_dos_file_name()` empirically
+ * only canonicalizes `.dll/.exe/.sys/.drv` extensions — for `.vst3`
+ * (our case) it returns the unusable `\\?\\unix\\...` form.
+ *
+ * Walks $WINEPREFIX/dosdevices/ for drive-letter symlinks (X:), finds
+ * the one whose target is the longest unix prefix of unixPath, and
+ * rewrites the path as `X:\\relative\\with\\backslashes`.
+ */
+inline String winelib_unix_to_dos_path (const String& unixPath)
+{
+    const char* prefixEnv = std::getenv ("WINEPREFIX");
+    if (prefixEnv == nullptr)
+        return unixPath;
+
+    const File dosDevicesDir = File (prefixEnv).getChildFile ("dosdevices");
+    if (! dosDevicesDir.isDirectory())
+        return unixPath;
+
+    const String unixPathStr = unixPath;
+    String bestLetter;
+    int bestMatchLen = 0;
+
+    for (const auto& entry : RangedDirectoryIterator (dosDevicesDir, false, "*", File::findDirectories))
+    {
+        const String name = entry.getFile().getFileName();
+        // Drive letters are exactly "X:" — skip "X::" block-device aliases.
+        if (name.length() != 2 || name[1] != ':'
+            || ! CharacterFunctions::isLetter (name[0]))
+            continue;
+
+        // Resolve symlink to its canonical target.
+        const File target = entry.getFile().getLinkedTarget();
+        String targetStr = target.getFullPathName();
+        if (targetStr.isEmpty())
+            continue;
+        if (! targetStr.endsWithChar ('/'))
+            targetStr += '/';
+
+        if (unixPathStr.length() >= targetStr.length()
+            && unixPathStr.substring (0, targetStr.length()) == targetStr
+            && targetStr.length() > (size_t) bestMatchLen)
+        {
+            bestLetter = String::charToString (CharacterFunctions::toUpperCase (name[0]));
+            bestMatchLen = (int) targetStr.length();
+        }
+    }
+
+    if (bestMatchLen == 0)
+        return unixPath;
+
+    String dos = bestLetter + ":\\" + unixPathStr.substring (bestMatchLen);
+    return dos.replaceCharacter ('/', '\\');
+}
+
+/* Phase 3 debug — append-only log to /tmp/winelib-vst3.log.
+ * Removed once Phase 3 plugin-load crash is diagnosed. */
+inline void winelib_log (const char* fmt, ...)
+{
+    static FILE* fp = std::fopen ("/tmp/winelib-vst3.log", "a");
+    if (fp == nullptr) return;
+    va_list args;
+    va_start (args, fmt);
+    std::vfprintf (fp, fmt, args);
+    va_end (args);
+    std::fputc ('\n', fp);
+    std::fflush (fp);
+}
+
 inline bool winelib_is_pe_file (const File& f)
 {
     FileInputStream stream (f);
     if (! stream.openedOk()) return false;
     char magic[2] = { 0, 0 };
-    return stream.read (magic, 2) == 2 && magic[0] == 'M' && magic[1] == 'Z';
+    bool isPE = stream.read (magic, 2) == 2 && magic[0] == 'M' && magic[1] == 'Z';
+    winelib_log ("[is_pe] '%s' magic=%02x%02x -> %d",
+                 f.getFullPathName().toRawUTF8(),
+                 (unsigned char) magic[0], (unsigned char) magic[1], (int) isPE);
+    return isPE;
 }
 
 inline std::vector<uint16_t> winelib_path_to_utf16 (const String& path)
@@ -1154,8 +1398,17 @@ struct DLLHandle
     VSTComSmartPtr<IPluginFactory> getPluginFactory()
     {
         if (factory == nullptr)
-            if (auto* proc = (GetFactoryProc) getFunction (factoryFnName))
-                factory = VSTComSmartPtr (proc(), IncrementRef::no);
+        {
+            auto* proc = (GetFactoryProc) getFunction (factoryFnName);
+            winelib_log ("[getPluginFactory] getFunction('%s') = %p",
+                         factoryFnName, (void*) proc);
+            if (proc != nullptr)
+            {
+                void* factoryRaw = proc();
+                winelib_log ("[getPluginFactory] factory proc() = %p", factoryRaw);
+                factory = VSTComSmartPtr ((IPluginFactory*) factoryRaw, IncrementRef::no);
+            }
+        }
 
         // The plugin NEEDS to provide a factory to be able to be called a VST3!
         // Most likely you are trying to load a 32-bit VST3 from a 64-bit host
@@ -1226,26 +1479,54 @@ private:
        #if JUCE_VST3_WINELIB
         if (winelib_is_pe_file (dllFile))
         {
+            winelib_log ("[DLLHandle::open] PE path for '%s'",
+                         dllFile.getFullPathName().toRawUTF8());
             /* Windows VST3 bundle — route through Wine's PE loader.
              * Entry point is "InitDll()" (no args), vs Linux's
-             * "ModuleEntry(module_handle)". */
-            auto widePath = winelib_path_to_utf16 (dllFile.getFullPathName());
-            peHandle = LoadLibraryW (widePath.data());
+             * "ModuleEntry(module_handle)".
+             *
+             * Convert the Linux path to a Wine DOS path BEFORE
+             * LoadLibraryW so the plugin's GetModuleFileNameW() returns
+             * a parseable "C:\\..." form.  See winelib_unix_to_dos_path
+             * docstring for the "Could not find binary path" rationale.
+             *
+             * Critical: LoadLibraryW (which triggers plugin's DllMain
+             * and static initialization) must run on a Win32-created
+             * thread so plugin's TEB / TLS / COM-apartment state is
+             * set up correctly.  If LoadLibraryW runs on a JUCE pthread,
+             * plugin's state lives in an incomplete Wine stub TEB and
+             * every later call from any thread sees mismatched state.
+             * Dispatch through the global Win32 worker.
+             */
+            const String dosPath = winelib_unix_to_dos_path (dllFile.getFullPathName());
+            winelib_log ("[DLLHandle::open] DOS path '%s'", dosPath.toRawUTF8());
+            auto widePath = winelib_path_to_utf16 (dosPath);
+            globalWineDispatcher().run ([&] { peHandle = LoadLibraryW (widePath.data()); });
+            winelib_log ("[DLLHandle::open] LoadLibraryW -> %p", peHandle);
             if (peHandle != nullptr)
             {
-                if (auto* proc = (PEInitProc) GetProcAddress (peHandle, peEntryFnName))
+                auto* proc = (PEInitProc) GetProcAddress (peHandle, peEntryFnName);
+                winelib_log ("[DLLHandle::open] InitDll proc=%p", (void*) proc);
+                if (proc != nullptr)
                 {
-                    if (proc())
+                    bool initOk = proc();
+                    winelib_log ("[DLLHandle::open] InitDll() returned %d", (int) initOk);
+                    if (initOk)
                         return true;
                 }
                 else
                 {
                     // InitDll is optional per the VST3 spec
+                    winelib_log ("[DLLHandle::open] no InitDll — treating as success");
                     return true;
                 }
 
                 FreeLibrary (peHandle);
                 peHandle = nullptr;
+            }
+            else
+            {
+                winelib_log ("[DLLHandle::open] LoadLibraryW FAILED");
             }
             return false;
         }
@@ -1365,7 +1646,22 @@ private:
          * `Contents/x86_64-win/<name>.vst3` — newer-format Windows
          * VST3.  (3) Fall through to Linux bundle layout (existing
          * behavior).  Order matters: many Windows plugins are
-         * single-file, so check that first. */
+         * single-file, so check that first.
+         *
+         * Skip yabridge-wrapped bundles: yabridge installs each plugin
+         * as a Linux VST3 bundle containing BOTH
+         * `Contents/x86_64-linux/<name>.so` (yabridge's Linux proxy that
+         * IPC-bridges back to a Wine host) AND
+         * `Contents/x86_64-win/<name>.vst3` (the real Windows PE).
+         * Loading the inner Win PE directly via our in-process Wine
+         * LoadLibraryW pipeline works, but if the user ALSO has the same
+         * plugin installed at $WINEPREFIX/.../VST3 (the byte-identical
+         * Win PE), Wine's module cache returns the same handle and the
+         * plugin's static state initializes twice in the same process —
+         * u-he ACE / Zebra2 crash on the second factory creation.
+         * Skipping the yabridge-wrapped path lets the WINEPREFIX copy
+         * be the single source of truth, and leaves yabridge itself
+         * untouched for native Linux hosts (Carla / Ardour). */
         {
             const File f { bundlePath };
 
@@ -1375,6 +1671,13 @@ private:
             const auto winBundle = f.getChildFile ("Contents")
                                     .getChildFile ("x86_64-win")
                                     .getChildFile (f.getFileNameWithoutExtension() + ".vst3");
+            const auto linuxProxy = f.getChildFile ("Contents")
+                                     .getChildFile ("x86_64-linux")
+                                     .getChildFile (f.getFileNameWithoutExtension() + ".so");
+
+            if (winBundle.existsAsFile() && linuxProxy.existsAsFile())
+                return File {};
+
             if (winBundle.existsAsFile())
                 return winBundle;
         }
@@ -1770,6 +2073,35 @@ struct VST3ComponentHolder
         if (factory->getClassInfo (classIdx, &info) != kResultOk)
             return false;
 
+       #if defined (__WINE__)
+        /* Plugin's createInstance + initialize must run on the SAME
+         * Win32 thread that will later call setBusArrangements / setActive
+         * / process.  Plugin's internal critical sections, TLS state, and
+         * thread-affinity assertions are all set up here.  Without this
+         * dispatch, plugin's state lives on JUCE's pthread (incomplete
+         * Wine stub TEB) and every later call from any thread sees a
+         * mismatch — culminating in ExitProcess.  Route both through
+         * the global Win32 worker so all plugin lifecycle calls share
+         * one consistent thread identity.
+         */
+        {
+            bool loaded = false;
+            globalWineDispatcher().run ([&] {
+                loaded = component.loadFrom (factory.get(), info.cid) && component != nullptr;
+            });
+            if (! loaded)
+                return false;
+        }
+
+        cidOfComponent = FUID (info.cid);
+
+        {
+            tresult r = kResultFalse;
+            globalWineDispatcher().run ([&] { r = component->initialize (host->getFUnknown()); });
+            if (warnOnFailure (r) != kResultOk)
+                return false;
+        }
+       #else
         if (! component.loadFrom (factory.get(), info.cid) || component == nullptr)
             return false;
 
@@ -1777,6 +2109,7 @@ struct VST3ComponentHolder
 
         if (warnOnFailure (component->initialize (host->getFUnknown())) != kResultOk)
             return false;
+       #endif
 
         isComponentInitialised = true;
 
@@ -2266,6 +2599,13 @@ public:
         holder->host->setPlugin (this);
     }
 
+   #if defined (__WINE__)
+    /* Winelib: one dedicated Win32 worker thread per plugin instance for
+     * dispatching lifecycle calls.  See WineWin32Dispatcher comment at
+     * top of file. */
+    WineWin32Dispatcher wineDispatcher;
+   #endif
+
     ~VST3PluginInstanceHeadless() override
     {
         MessageManager::callSync ([this] { cleanup(); });
@@ -2449,7 +2789,14 @@ public:
         // If the plugin has already been activated (prepareToPlay has been called twice without
         // a matching releaseResources call) deactivate it so that the speaker layout and bus
         // activation can be updated safely.
+       #if defined (__WINE__)
+        /* deactivate() calls setProcessing(false), setActive(false), and
+         * setStateForAllMidiBuses(false) — all plugin lifecycle calls.
+         * Must run on the same Win32 worker as the rest. */
+        globalWineDispatcher().run ([&] { deactivate(); });
+       #else
         deactivate();
+       #endif
 
         ProcessSetup setup;
         setup.symbolicSampleSize    = isUsingDoublePrecision() ? kSample64 : kSample32;
@@ -2457,23 +2804,81 @@ public:
         setup.sampleRate            = newSampleRate;
         setup.processMode           = isNonRealtime() ? kOffline : kRealtime;
 
+       #if defined (__WINE__)
+        /* Run setupProcessing on the Win32 worker thread so plugin sees
+         * proper Win32 thread context (TEB, COM apartment, TLS).  Without
+         * this, u-he plugins call ExitProcess() from inside their
+         * setupProcessing implementation when they hit thread-context
+         * checks that fail under pthread caller. */
+        {
+            tresult r = kResultFalse;
+            globalWineDispatcher().run ([&] { r = processor->setupProcessing (setup); });
+            warnOnFailure (r);
+        }
+       #else
         warnOnFailure (processor->setupProcessing (setup));
+       #endif
 
+       #if defined (__WINE__)
+        /* holder->initialise() calls IComponent::initialize internally —
+         * plugin's per-instance init runs there.  Dispatch to Win32
+         * worker so any TLS / COM-apartment state plugin sets up here
+         * lives on the worker thread, matching where later calls
+         * (setBusArrangements, setActive, process) will run. */
+        globalWineDispatcher().run ([&] { holder->initialise(); });
+       #else
         holder->initialise();
+       #endif
 
+       #if defined (__WINE__)
+        /* busLayoutsToArrangements internally calls processor->getBusArrangement
+         * which is a plugin call — must run on Win32 worker. */
+        std::vector<SpeakerArrangement> inArrangements;
+        std::vector<SpeakerArrangement> outArrangements;
+        globalWineDispatcher().run ([&] {
+            inArrangements  = busLayoutsToArrangements (true) .value_or (std::vector<SpeakerArrangement>{});
+            outArrangements = busLayoutsToArrangements (false).value_or (std::vector<SpeakerArrangement>{});
+        });
+       #else
         auto inArrangements  = busLayoutsToArrangements (true) .value_or (std::vector<SpeakerArrangement>{});
         auto outArrangements = busLayoutsToArrangements (false).value_or (std::vector<SpeakerArrangement>{});
+       #endif
 
         // Some plug-ins will crash if you pass a nullptr to setBusArrangements!
         SpeakerArrangement nullArrangement = {};
         auto* inData  = inArrangements .empty() ? &nullArrangement : inArrangements .data();
         auto* outData = outArrangements.empty() ? &nullArrangement : outArrangements.data();
 
+       #if defined (__WINE__)
+        /* setBusArrangements is what we observed in the log right before
+         * ExitProcess() fires (plugin printed "setBusArrangements 0 1 vs
+         * 0 1" then died).  Dispatch through the Win32 worker so plugin
+         * sees proper Win32 thread context. */
+        {
+            tresult r = kResultFalse;
+            globalWineDispatcher().run ([&] {
+                r = processor->setBusArrangements (inData,  static_cast<int32> (inArrangements .size()),
+                                                   outData, static_cast<int32> (outArrangements.size()));
+            });
+            warnOnFailure (r);
+        }
+       #else
         warnOnFailure (processor->setBusArrangements (inData,  static_cast<int32> (inArrangements .size()),
                                                       outData, static_cast<int32> (outArrangements.size())));
+       #endif
 
+       #if defined (__WINE__)
+        /* getActualArrangements internally calls processor->getBusArrangement
+         * (plugin call).  Dispatch as a unit. */
+        std::vector<SpeakerArrangement> inArrActual, outArrActual;
+        globalWineDispatcher().run ([&] {
+            inArrActual  = getActualArrangements (true);
+            outArrActual = getActualArrangements (false);
+        });
+       #else
         const auto inArrActual  = getActualArrangements (true);
         const auto outArrActual = getActualArrangements (false);
+       #endif
 
         jassert (inArrActual == inArrangements && outArrActual == outArrangements);
 
@@ -2483,21 +2888,76 @@ public:
         auto numInputBuses  = getBusCount (true);
         auto numOutputBuses = getBusCount (false);
 
+       #if defined (__WINE__)
+        /* activateBus also runs inside plugin code that may need Win32
+         * context.  Dispatch each activation through the worker. */
+        for (int i = 0; i < numInputBuses; ++i)
+        {
+            tresult r = kResultFalse;
+            const Steinberg::int32 state = getBus (true, i)->isEnabled() ? 1 : 0;
+            winelib_log("[dispatch] activateBus input %d", i); globalWineDispatcher().run ([&] { r = holder->component->activateBus (Vst::kAudio, Vst::kInput, i, state); });
+            warnOnFailure (r);
+        }
+        for (int i = 0; i < numOutputBuses; ++i)
+        {
+            tresult r = kResultFalse;
+            const Steinberg::int32 state = getBus (false, i)->isEnabled() ? 1 : 0;
+            winelib_log("[dispatch] activateBus output %d", i); globalWineDispatcher().run ([&] { r = holder->component->activateBus (Vst::kAudio, Vst::kOutput, i, state); });
+            warnOnFailure (r);
+        }
+       #else
         for (int i = 0; i < numInputBuses; ++i)
             warnOnFailure (holder->component->activateBus (Vst::kAudio, Vst::kInput,  i, getBus (true,  i)->isEnabled() ? 1 : 0));
 
         for (int i = 0; i < numOutputBuses; ++i)
             warnOnFailure (holder->component->activateBus (Vst::kAudio, Vst::kOutput, i, getBus (false, i)->isEnabled() ? 1 : 0));
+       #endif
 
+       #if defined (__WINE__)
+        /* processor->getLatencySamples() is a plugin call.  Dispatch. */
+        {
+            int latency = 0;
+            winelib_log("[dispatch] getLatencySamples"); globalWineDispatcher().run ([&] { latency = (int) processor->getLatencySamples(); });
+            setLatencySamples (jmax (0, latency));
+        }
+       #else
         setLatencySamples (jmax (0, (int) processor->getLatencySamples()));
+       #endif
 
         inputBusMap .prepare (createChannelMappings (true));
         outputBusMap.prepare (createChannelMappings (false));
 
+       #if defined (__WINE__)
+        /* setStateForAllMidiBuses internally calls activateBus on event
+         * buses — plugin lifecycle calls.  Dispatch as a unit. */
+        winelib_log("[dispatch] setStateForAllMidiBuses"); globalWineDispatcher().run ([&] { setStateForAllMidiBuses (true); });
+       #else
         setStateForAllMidiBuses (true);
+       #endif
 
+       #if defined (__WINE__)
+        /* Run setActive(true) + setProcessing(true) on the Win32 worker
+         * thread.  These are the calls immediately preceding the
+         * ExitProcess crash we observed — plugin's audio engine init
+         * runs here and assumes proper Win32 thread context. */
+        {
+            tresult r = kResultFalse;
+            winelib_log("[dispatch] setActive(true)"); globalWineDispatcher().run ([&] { r = holder->component->setActive (true); });
+            warnOnFailure (r);
+        }
+        {
+            tresult r = kResultFalse;
+            globalWineDispatcher().run ([&] { r = processor->setProcessing (true); });
+            warnOnFailureIfImplemented (r);
+        }
+       #else
         warnOnFailure (holder->component->setActive (true));
         warnOnFailureIfImplemented (processor->setProcessing (true));
+       #endif
+
+        // (Pre-warm processAudio() removed — empirically it didn't help
+        // and it ran on the un-dispatched message thread which would
+        // itself trigger plugin's ExitProcess.)
 
         isActive = true;
     }
@@ -2621,7 +3081,17 @@ public:
             inputParameterChanges->set (cachedParamValues.getParamID (index), value, 0);
         });
 
+       #if defined (__WINE__)
+        /* Audio process call — dispatch to the Win32 worker so plugin's
+         * process() runs in the same thread context as its init.  Yes
+         * this serializes audio through the worker; for in-process VST3
+         * hosting under winelib it's correctness > latency.  Once the
+         * core crash is gone we can build a per-instance audio worker
+         * with pi_cond signaling for lower latency. */
+        globalWineDispatcher().run ([&] { processor->process (data); });
+       #else
         processor->process (data);
+       #endif
 
         outputParameterChanges->forEach ([&] (Steinberg::int32 vstParamIndex, Vst::ParamID id, float value)
         {

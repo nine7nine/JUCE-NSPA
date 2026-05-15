@@ -71,6 +71,13 @@ inline void toString128 (Steinberg::Vst::String128 result, const juce::String& s
  static const Steinberg::FIDString defaultVST3WindowType = Steinberg::kPlatformTypeHWND;
 #elif JUCE_MAC
  static const Steinberg::FIDString defaultVST3WindowType = Steinberg::kPlatformTypeNSView;
+#elif defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
+ // winelib host: we present a real Wine HWND to the plugin via
+ // WineHWNDEmbedComponent (its X11 backing window is reparented into
+ // JUCE's X11 widget tree).  Windows-only VST3 plugins (u-he, etc.)
+ // support only kPlatformTypeHWND; the Linux X11EmbedWindowID type is
+ // rejected.
+ static const Steinberg::FIDString defaultVST3WindowType = Steinberg::kPlatformTypeHWND;
 #elif JUCE_LINUX || JUCE_BSD
  static const Steinberg::FIDString defaultVST3WindowType = Steinberg::kPlatformTypeX11EmbedWindowID;
 #endif
