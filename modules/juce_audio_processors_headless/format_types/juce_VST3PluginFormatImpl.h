@@ -1086,7 +1086,6 @@ extern "C" {
     int         __stdcall FreeLibrary    (void* hModule);
 }
 
-namespace {
 //==============================================================================
 // Winelib Win32 thread dispatcher — see yabridge/src/wine-host/utils.h
 // (Win32Thread class) for the motivation: when a winelib ELF (compiled in
@@ -1100,11 +1099,27 @@ namespace {
 // our diagnostics caught (LdrShutdownProcess from inside the plugin
 // without any prior signal / abort / C++ exception).
 //
-// Solution: one dedicated Win32 worker thread per VST3PluginInstance.
-// JUCE pthreads marshal plugin lifecycle calls to the worker through a
-// std::mutex+condvar request/done pair.  The worker runs plugin code in
-// proper Win32 context.  Synchronous dispatch — caller blocks until the
-// worker finishes.  No queue depth > 1 (we always wait for completion).
+// Solution: one dedicated Win32 worker thread per VST3 instance, owned
+// by VST3ComponentHolder (declared first among its members so it
+// outlives every other plugin-touching field through teardown).
+// JUCE pthreads marshal plugin lifecycle + audio calls to the instance's
+// worker through a std::mutex+condvar request/done pair (pthread today;
+// pi_mutex_t/pi_cond_t librtpi swap planned for a future RT pass — see
+// project_winelib_juce_librtpi_direct_phase3_preferred memo).  The worker
+// runs plugin code in proper Win32 context.  Synchronous dispatch — caller
+// blocks until the worker finishes.  No queue depth > 1 (we always wait
+// for completion).
+//
+// One global dispatcher (globalWineDispatcher() below) still exists — used
+// EXCLUSIVELY for the one-time LoadLibraryW per DLL.  DllMain runs once
+// per PE binary regardless of how many VST3 instances later mint
+// themselves out of it; each per-instance CreateThread delivers a fresh
+// DLL_THREAD_ATTACH callback to the plugin's DllMain.  All later
+// per-instance work (createInstance, initialize, setupProcessing,
+// setActive, process, terminate) goes to the instance's own worker so
+// the plugin sees one stable Win32 thread identity for that instance's
+// entire lifetime, and N instances run on N parallel workers (no
+// serialization through a single bottleneck across plugins).
 //
 // Win32 API forward decls (Phase 2 pattern — avoid pulling <windows.h>
 // in our JUCE_LINUX-mode TU).  On x86_64 winelib `__stdcall` resolves to
@@ -1127,9 +1142,20 @@ extern "C" {
     WineBOOL   __stdcall CloseHandle         (WineHANDLE handle);
     int        __stdcall OleInitialize       (void* reserved);
     void       __stdcall OleUninitialize     (void);
+
+    // RT priority promotion — see yabridge/src/wine-host/nspa_rt.h.
+    // SetThreadPriority(TIME_CRITICAL) routes through ntdll's
+    // NtSetInformationThread(ThreadBasePriority) handler, which under
+    // NSPA resolves to SCHED_FIFO at NSPA_RT_PRIO.  Without this the
+    // per-instance worker stays at THREAD_PRIORITY_NORMAL inside the
+    // process's REALTIME_PRIORITY_CLASS and never reaches NSPA's audio
+    // band.
+    WineHANDLE __stdcall GetCurrentThread    (void);
+    WineBOOL   __stdcall SetThreadPriority   (WineHANDLE handle, int priority);
 }
 
-constexpr WineDWORD WINELIB_INFINITE = 0xFFFFFFFFu;
+constexpr WineDWORD WINELIB_INFINITE             = 0xFFFFFFFFu;
+constexpr int       WINELIB_THREAD_TIME_CRITICAL = 15;  // THREAD_PRIORITY_TIME_CRITICAL
 
 class WineWin32Dispatcher
 {
@@ -1171,6 +1197,17 @@ public:
             fn();
             return;
         }
+        // Self-dispatch guard: if a dispatched call recursively calls
+        // run() (e.g. a wrapped lifecycle helper that internally invokes
+        // dispatch on another call site), don't deadlock — run inline
+        // on the worker itself.  Without this guard the worker would
+        // block in cvDone.wait while being the only thread that can
+        // clear taskPending.
+        if (std::this_thread::get_id() == workerThreadId)
+        {
+            fn();
+            return;
+        }
         std::unique_lock<std::mutex> lk (mtx);
         currentTask = std::move (fn);
         taskPending = true;
@@ -1189,7 +1226,23 @@ private:
         // ExitProcess path.  Mirror of yabridge's host.cpp:112 but on
         // the worker thread instead of the host main.
         OleInitialize (nullptr);
-        static_cast<WineWin32Dispatcher*> (selfPtr)->workerLoop();
+
+        // Promote to NSPA's RT band.  SetThreadPriority(TIME_CRITICAL)
+        // routes through ntdll's NtSetInformationThread handler under
+        // NSPA, which maps to SCHED_FIFO at NSPA_RT_PRIO.  Mirror of
+        // yabridge::nspa::set_thread_time_critical (nspa_rt.h:71).
+        // Plugin worker pools spawned during PROCESS_ATTACH / DllMain /
+        // pluginCreate inherit the creator's scheduling — without this
+        // promotion u-he's boost::thread workers throw
+        // boost::thread_resource_error when the kernel refuses
+        // pthread_create's RT request from a non-RT parent.  Process
+        // priority class is already REALTIME via Element's
+        // WinelibPluginHostInit (src/main.cc).
+        SetThreadPriority (GetCurrentThread(), WINELIB_THREAD_TIME_CRITICAL);
+
+        auto* self = static_cast<WineWin32Dispatcher*> (selfPtr);
+        self->workerThreadId = std::this_thread::get_id();
+        self->workerLoop();
         OleUninitialize();
         return 0;
     }
@@ -1218,6 +1271,7 @@ private:
     }
 
     WineHANDLE             workerThread = nullptr;
+    std::thread::id        workerThreadId{};
     std::mutex             mtx;
     std::condition_variable cvRequest;
     std::condition_variable cvDone;
@@ -1226,22 +1280,19 @@ private:
     bool                   shutdown    = false;
 };
 
-/* Global Win32 dispatcher — single worker thread serving ALL plugin
- * operations (DLL load, factory createInstance, lifecycle, audio).
+namespace {
+/* Global Win32 dispatcher — used EXCLUSIVELY for the one-time
+ * LoadLibraryW per PE binary (DLLHandle::open).  DllMain runs once per
+ * DLL regardless of how many VST3 instances later use it.  Keeping
+ * LoadLibraryW on a stable Win32 thread means the plugin's
+ * PROCESS_ATTACH executes in proper Win32 context; later per-instance
+ * CreateThread calls deliver DLL_THREAD_ATTACH callbacks to the
+ * plugin's DllMain for the new worker threads automatically.
  *
- * Per-instance dispatchers fail because the plugin's DllMain and early
- * state setup happen on whichever thread first calls LoadLibraryW —
- * usually JUCE's message thread (pthread, incomplete TEB).  Later
- * lifecycle calls on the per-instance Win32 worker thread can't find
- * the TEB-local state plugin set up on the pthread, and the plugin
- * eventually calls ExitProcess().
- *
- * Routing every plugin-touching call through ONE Win32 worker means
- * the plugin's DllMain runs on a proper Win32 thread, all state setup
- * lives on that thread, all later calls find that state.  Single
- * point of serialization for plugin operations (acceptable — these
- * calls aren't on the RT audio hot path; audio dispatch can be a
- * separate per-instance worker later).
+ * All per-instance plugin operations (createInstance, initialize,
+ * setActive, process, etc.) go to the per-instance worker on
+ * VST3ComponentHolder.wineDispatcher — see comment on
+ * WineWin32Dispatcher above.
  */
 inline WineWin32Dispatcher& globalWineDispatcher()
 {
@@ -1914,6 +1965,11 @@ struct VST3ComponentHolder
 
     ~VST3ComponentHolder()
     {
+        // terminate() routes plugin calls through wineDispatcher in the
+        // winelib build — wineDispatcher must still be alive here.  C++
+        // destructs members in reverse declaration order, and
+        // wineDispatcher is declared FIRST in this struct, so it
+        // outlives terminate().
         terminate();
     }
 
@@ -2080,13 +2136,14 @@ struct VST3ComponentHolder
          * thread-affinity assertions are all set up here.  Without this
          * dispatch, plugin's state lives on JUCE's pthread (incomplete
          * Wine stub TEB) and every later call from any thread sees a
-         * mismatch — culminating in ExitProcess.  Route both through
-         * the global Win32 worker so all plugin lifecycle calls share
-         * one consistent thread identity.
+         * mismatch — culminating in ExitProcess.  Route both through the
+         * per-instance Win32 worker (member of THIS holder) so all
+         * plugin lifecycle + audio calls for this instance share one
+         * stable thread identity for the instance's whole lifetime.
          */
         {
             bool loaded = false;
-            globalWineDispatcher().run ([&] {
+            wineDispatcher.run ([&] {
                 loaded = component.loadFrom (factory.get(), info.cid) && component != nullptr;
             });
             if (! loaded)
@@ -2097,7 +2154,7 @@ struct VST3ComponentHolder
 
         {
             tresult r = kResultFalse;
-            globalWineDispatcher().run ([&] { r = component->initialize (host->getFUnknown()); });
+            wineDispatcher.run ([&] { r = component->initialize (host->getFUnknown()); });
             if (warnOnFailure (r) != kResultOk)
                 return false;
         }
@@ -2118,6 +2175,28 @@ struct VST3ComponentHolder
 
     void terminate()
     {
+       #if defined (__WINE__)
+        /* Plugin's terminate() and the implicit component smartptr
+         * Release that follows are both plugin calls.  Route through
+         * the per-instance worker so they run on the same thread as
+         * initialize / setActive / process.  Without this, plugin sees
+         * a thread-id mismatch on teardown — works for u-he today by
+         * coincidence, but breaks the per-instance worker model's
+         * invariant ("one stable thread identity per instance for the
+         * entire lifetime").  Self-dispatch guard in run() makes this
+         * safe even if called from the worker itself.
+         */
+        wineDispatcher.run ([&]
+        {
+            if (isComponentInitialised)
+            {
+                component->terminate();
+                isComponentInitialised = false;
+            }
+
+            component = nullptr;
+        });
+       #else
         if (isComponentInitialised)
         {
             component->terminate();
@@ -2125,9 +2204,30 @@ struct VST3ComponentHolder
         }
 
         component = nullptr;
+       #endif
     }
 
     //==============================================================================
+   #if defined (__WINE__)
+    /* Per-instance Win32 worker thread.  ALL plugin-touching calls
+     * for this instance (createInstance, initialize, setupProcessing,
+     * setActive, process, terminate, component release) run on this
+     * worker so the plugin sees one stable Win32 thread identity for
+     * its entire lifetime.
+     *
+     * Declared FIRST among non-trivial members so C++'s reverse-order
+     * member destruction tears it down LAST — terminate() in our
+     * destructor body, and any plugin Release that runs as later
+     * members are destructed, both find the worker still alive.
+     *
+     * Lives on the holder (not on VST3PluginInstanceHeadless) because
+     * holder->initialise() needs to dispatch createInstance +
+     * component->initialize BEFORE the plugin instance exists; the
+     * holder is constructed first in createVST3Instance().
+     */
+    WineWin32Dispatcher wineDispatcher;
+   #endif
+
     VST3ModuleHandle module;
     VSTComSmartPtr<VST3HostContextHeadless> host;
     VSTComSmartPtr<Vst::IComponent> component;
@@ -2599,12 +2699,11 @@ public:
         holder->host->setPlugin (this);
     }
 
-   #if defined (__WINE__)
-    /* Winelib: one dedicated Win32 worker thread per plugin instance for
-     * dispatching lifecycle calls.  See WineWin32Dispatcher comment at
-     * top of file. */
-    WineWin32Dispatcher wineDispatcher;
-   #endif
+    /* Per-instance Win32 worker thread lives on the holder
+     * (holder->wineDispatcher) so that createInstance and
+     * component->initialize — which run in holder->initialise() BEFORE
+     * this instance exists — already use the same worker that later
+     * lifecycle / audio calls will use.  See VST3ComponentHolder. */
 
     ~VST3PluginInstanceHeadless() override
     {
@@ -2793,7 +2892,7 @@ public:
         /* deactivate() calls setProcessing(false), setActive(false), and
          * setStateForAllMidiBuses(false) — all plugin lifecycle calls.
          * Must run on the same Win32 worker as the rest. */
-        globalWineDispatcher().run ([&] { deactivate(); });
+        holder->wineDispatcher.run ([&] { deactivate(); });
        #else
         deactivate();
        #endif
@@ -2812,30 +2911,27 @@ public:
          * checks that fail under pthread caller. */
         {
             tresult r = kResultFalse;
-            globalWineDispatcher().run ([&] { r = processor->setupProcessing (setup); });
+            holder->wineDispatcher.run ([&] { r = processor->setupProcessing (setup); });
             warnOnFailure (r);
         }
        #else
         warnOnFailure (processor->setupProcessing (setup));
        #endif
 
-       #if defined (__WINE__)
-        /* holder->initialise() calls IComponent::initialize internally —
-         * plugin's per-instance init runs there.  Dispatch to Win32
-         * worker so any TLS / COM-apartment state plugin sets up here
-         * lives on the worker thread, matching where later calls
-         * (setBusArrangements, setActive, process) will run. */
-        globalWineDispatcher().run ([&] { holder->initialise(); });
-       #else
+        /* holder->initialise() short-circuits on isComponentInitialised
+         * (set true during createVST3Instance() before this instance
+         * even existed).  The call is idempotent and reaches no plugin
+         * code; the per-instance worker dispatch that used to wrap it
+         * was double-wasted (dispatch round-trip around a function
+         * whose body immediately returns).  Calling directly. */
         holder->initialise();
-       #endif
 
        #if defined (__WINE__)
         /* busLayoutsToArrangements internally calls processor->getBusArrangement
          * which is a plugin call — must run on Win32 worker. */
         std::vector<SpeakerArrangement> inArrangements;
         std::vector<SpeakerArrangement> outArrangements;
-        globalWineDispatcher().run ([&] {
+        holder->wineDispatcher.run ([&] {
             inArrangements  = busLayoutsToArrangements (true) .value_or (std::vector<SpeakerArrangement>{});
             outArrangements = busLayoutsToArrangements (false).value_or (std::vector<SpeakerArrangement>{});
         });
@@ -2856,7 +2952,7 @@ public:
          * sees proper Win32 thread context. */
         {
             tresult r = kResultFalse;
-            globalWineDispatcher().run ([&] {
+            holder->wineDispatcher.run ([&] {
                 r = processor->setBusArrangements (inData,  static_cast<int32> (inArrangements .size()),
                                                    outData, static_cast<int32> (outArrangements.size()));
             });
@@ -2871,7 +2967,7 @@ public:
         /* getActualArrangements internally calls processor->getBusArrangement
          * (plugin call).  Dispatch as a unit. */
         std::vector<SpeakerArrangement> inArrActual, outArrActual;
-        globalWineDispatcher().run ([&] {
+        holder->wineDispatcher.run ([&] {
             inArrActual  = getActualArrangements (true);
             outArrActual = getActualArrangements (false);
         });
@@ -2895,14 +2991,14 @@ public:
         {
             tresult r = kResultFalse;
             const Steinberg::int32 state = getBus (true, i)->isEnabled() ? 1 : 0;
-            winelib_log("[dispatch] activateBus input %d", i); globalWineDispatcher().run ([&] { r = holder->component->activateBus (Vst::kAudio, Vst::kInput, i, state); });
+            winelib_log("[dispatch] activateBus input %d", i); holder->wineDispatcher.run ([&] { r = holder->component->activateBus (Vst::kAudio, Vst::kInput, i, state); });
             warnOnFailure (r);
         }
         for (int i = 0; i < numOutputBuses; ++i)
         {
             tresult r = kResultFalse;
             const Steinberg::int32 state = getBus (false, i)->isEnabled() ? 1 : 0;
-            winelib_log("[dispatch] activateBus output %d", i); globalWineDispatcher().run ([&] { r = holder->component->activateBus (Vst::kAudio, Vst::kOutput, i, state); });
+            winelib_log("[dispatch] activateBus output %d", i); holder->wineDispatcher.run ([&] { r = holder->component->activateBus (Vst::kAudio, Vst::kOutput, i, state); });
             warnOnFailure (r);
         }
        #else
@@ -2917,7 +3013,7 @@ public:
         /* processor->getLatencySamples() is a plugin call.  Dispatch. */
         {
             int latency = 0;
-            winelib_log("[dispatch] getLatencySamples"); globalWineDispatcher().run ([&] { latency = (int) processor->getLatencySamples(); });
+            winelib_log("[dispatch] getLatencySamples"); holder->wineDispatcher.run ([&] { latency = (int) processor->getLatencySamples(); });
             setLatencySamples (jmax (0, latency));
         }
        #else
@@ -2930,7 +3026,7 @@ public:
        #if defined (__WINE__)
         /* setStateForAllMidiBuses internally calls activateBus on event
          * buses — plugin lifecycle calls.  Dispatch as a unit. */
-        winelib_log("[dispatch] setStateForAllMidiBuses"); globalWineDispatcher().run ([&] { setStateForAllMidiBuses (true); });
+        winelib_log("[dispatch] setStateForAllMidiBuses"); holder->wineDispatcher.run ([&] { setStateForAllMidiBuses (true); });
        #else
         setStateForAllMidiBuses (true);
        #endif
@@ -2942,12 +3038,12 @@ public:
          * runs here and assumes proper Win32 thread context. */
         {
             tresult r = kResultFalse;
-            winelib_log("[dispatch] setActive(true)"); globalWineDispatcher().run ([&] { r = holder->component->setActive (true); });
+            winelib_log("[dispatch] setActive(true)"); holder->wineDispatcher.run ([&] { r = holder->component->setActive (true); });
             warnOnFailure (r);
         }
         {
             tresult r = kResultFalse;
-            globalWineDispatcher().run ([&] { r = processor->setProcessing (true); });
+            holder->wineDispatcher.run ([&] { r = processor->setProcessing (true); });
             warnOnFailureIfImplemented (r);
         }
        #else
@@ -3082,13 +3178,15 @@ public:
         });
 
        #if defined (__WINE__)
-        /* Audio process call — dispatch to the Win32 worker so plugin's
-         * process() runs in the same thread context as its init.  Yes
-         * this serializes audio through the worker; for in-process VST3
-         * hosting under winelib it's correctness > latency.  Once the
-         * core crash is gone we can build a per-instance audio worker
-         * with pi_cond signaling for lower latency. */
-        globalWineDispatcher().run ([&] { processor->process (data); });
+        /* Audio process call — dispatch to the per-instance Win32 worker
+         * so the plugin sees the same thread identity here as it did
+         * during init/setActive.  Worker is per-instance, so N JACK-
+         * callback-driven process() calls across N instances run on N
+         * parallel workers (no global bottleneck).  The dispatch
+         * round-trip is currently two pthread futex hops; planned librtpi
+         * (pi_cond_t/pi_mutex_t) swap will lower that and add priority
+         * inheritance — see librtpi-direct memo. */
+        holder->wineDispatcher.run ([&] { processor->process (data); });
        #else
         processor->process (data);
        #endif
