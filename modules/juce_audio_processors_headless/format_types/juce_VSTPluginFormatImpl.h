@@ -1994,8 +1994,15 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
                                                                                  void* ptr,
                                                                                  float opt)
     {
-        JUCE_VST_LOG ("[winelib] audioMaster: opcode=" + String ((int) opcode)
-                       + " eff=" + String::toHexString ((pointer_sized_int) eff));
+        /* NO JUCE_VST_LOG HERE.  This thunk is called from the plugin
+         * on every block (opcodes 7 = audioMasterGetTime and 23 =
+         * audioMasterGetCurrentProcessLevel are typical per-block
+         * queries).  Under SCHED_FIFO@80 on the per-instance worker,
+         * each Logger::writeToLog hits JUCE's plain std::mutex (no PI)
+         * around the FileLogger's file write — the audio thread
+         * blocks on a UI-thread-held lock and JACK xruns, plus the UI
+         * thread gets starved of CPU.  Looked like a "freeze" in the
+         * Phase 4.x bring-up of Chromaphone. */
         if (eff != nullptr)
             if (auto* instance = (VSTPluginInstanceHeadless*) (eff->resvd2))
                 return instance->handleCallback (opcode, index, value, ptr, opt);
@@ -2057,26 +2064,83 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
                  * effSetBlockSize (see `create()`).  Plugins stash
                  * thread-affinity state in their internal
                  * CRITICAL_SECTIONs; mismatched callers trip
-                 * ExitProcess assertions.  Self-dispatch guard inside
-                 * `run()` lets the host callback chain (which lands
-                 * back here from inside a plugin call) execute inline
-                 * on the worker without re-queueing.
+                 * ExitProcess assertions.  Dispatcher is called via
+                 * winelib_vst2_abi::callDispatcher which casts the
+                 * slot to an ms_abi-typed pointer.
                  *
-                 * Dispatcher is called via winelib_vst2_abi::callDispatcher
-                 * which reinterpret_casts the slot to an ms_abi-typed
-                 * pointer — see helpers at the top of this file.
+                 * EXCEPTION — GUI opcodes (effEdit*) MUST stay on the
+                 * JUCE UI thread and NOT bounce to the worker.  The
+                 * plugin's effEditOpen calls CreateWindowExW which
+                 * posts WM_CREATE/WM_NCCREATE to the creating
+                 * thread's Win32 queue and BLOCKS waiting for the
+                 * window proc to dispatch them.  Our UI thread runs
+                 * WineHWNDEmbedComponent::Timer at ~60Hz which does
+                 * PeekMessageW pumping the queue; the worker thread
+                 * does NOT pump.  Routing effEditOpen via the worker
+                 * deadlocks: UI thread blocks in wineDispatcher.run
+                 * waiting for the worker, worker blocks in
+                 * CreateWindowExW waiting for the UI thread's pump.
+                 * VST3 sidesteps this naturally because IPlugView::
+                 * attached is a vtable call directly from the UI
+                 * thread; VST2's opcode model means we have to gate
+                 * explicitly here.
                  *
-                 * BOTH branches (with-worker AND fallback) MUST use
-                 * callDispatcher.  The wineDispatcher is set on the
-                 * instance AFTER std::make_unique returns from
-                 * create(); the constructor's refreshParameterList
-                 * runs while wineDispatcher is still null, so the
-                 * else branch fires during init — and a direct
-                 * `vstEffect->dispatcher(...)` there would use System V
-                 * ABI on a PE function pointer, killing the process
-                 * the moment the constructor tries to enumerate
-                 * parameters via effCanBeAutomated. */
-                if (wineDispatcher != nullptr)
+                 * effEditIdle / effEditClose / effEditGetRect /
+                 * effEditKeyDown / effEditKeyUp / effEditTop also
+                 * touch the plugin's window state — same UI thread.
+                 *
+                 * The ms_abi cast still applies; we just skip the
+                 * worker bounce.
+                 *
+                 * Both branches go through callDispatcher because
+                 * wineDispatcher may be null during the constructor's
+                 * refreshParameterList path. */
+                /* yabridge's "unsafe_requests" set
+                 * (src/wine-host/bridges/vst2.cpp:109-113): VST2
+                 * opcodes that interact with the Win32 message loop
+                 * or otherwise expect to run on the main GUI thread.
+                 * yabridge's exact comment for effMainsChanged:
+                 * "EZdrummer interacts with the Win32 message loop
+                 *  during this function. If we don't execute this
+                 *  from the main GUI thread, then EZdrummer won't
+                 *  produce any sound."  Same pattern for the others
+                 *  (effOpen / effClose / effSet{SampleRate,BlockSize}
+                 *  / effVendorSpecific / effGetChunk / effSetChunk /
+                 *  effBeginLoad{Bank,Program}).  Routing them through
+                 *  the per-instance worker (which has no Win32 message
+                 *  pump) deadlocks the plugin on its own internal
+                 *  CreateWindow / message-wait calls.  Same kind of
+                 *  thing as VST3 IPlugView::attached running on UI
+                 *  thread by design.
+                 *
+                 * The ms_abi cast still applies; we just skip the
+                 * worker bounce so the call runs on whatever JUCE
+                 * thread issued the dispatch — which for plugin
+                 * lifecycle/UI is the message thread that pumps
+                 * Win32 messages via WineHWNDEmbedComponent::Timer. */
+                const bool runOnCallerThread =
+                       opcode == Vst2::effOpen
+                    || opcode == Vst2::effClose
+                    || opcode == Vst2::effEditOpen
+                    || opcode == Vst2::effEditClose
+                    || opcode == Vst2::effEditIdle
+                    || opcode == Vst2::effEditGetRect
+                    || opcode == Vst2::effEditKeyDown
+                    || opcode == Vst2::effEditKeyUp
+                    || opcode == Vst2::effEditTop
+                    || opcode == Vst2::effMainsChanged
+                    || opcode == Vst2::effGetChunk
+                    || opcode == Vst2::effSetChunk
+                    || opcode == Vst2::effBeginLoadBank
+                    || opcode == Vst2::effBeginLoadProgram
+                    || opcode == Vst2::effSetSampleRate
+                    || opcode == Vst2::effSetBlockSize
+                    || opcode == Vst2::effVendorSpecific;
+
+                if (runOnCallerThread)
+                    JUCE_VST_LOG ("[winelib:dispatch] opcode=" + String ((int) opcode) + " (inline, caller thread)");
+
+                if (wineDispatcher != nullptr && ! runOnCallerThread)
                 {
                     wineDispatcher->run ([&]
                     {
@@ -2087,6 +2151,9 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
                 {
                     result = winelib_vst2_abi::callDispatcher (vstEffect, opcode, index, value, ptr, opt);
                 }
+
+                if (runOnCallerThread)
+                    JUCE_VST_LOG ("[winelib:dispatch] opcode=" + String ((int) opcode) + " returned " + String ((juce::int64) result));
                #else
                 {
                     result = vstEffect->dispatcher (vstEffect, opcode, index, value, ptr, opt);
