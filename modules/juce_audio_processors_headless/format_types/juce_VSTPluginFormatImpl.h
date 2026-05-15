@@ -147,6 +147,8 @@ namespace winelib_vst2_abi
     using ProcessReplacingMS   = void              __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, float**, float**, Vst2::VstInt32);
     using ProcessDoubleMS      = void              __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, double**, double**, Vst2::VstInt32);
     using ProcessLegacyMS      = void              __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, float**, float**, Vst2::VstInt32);
+    using GetParameterMS       = float             __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, Vst2::VstInt32);
+    using SetParameterMS       = void              __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, Vst2::VstInt32, float);
     using AudioMasterMS        = Vst2::VstIntPtr   __attribute__((__ms_abi__)) (*) (Vst2::AEffect*, Vst2::VstInt32, Vst2::VstInt32, Vst2::VstIntPtr, void*, float);
     using VstMainMS            = Vst2::AEffect*    __attribute__((__ms_abi__)) (*) (AudioMasterMS);
 
@@ -172,6 +174,16 @@ namespace winelib_vst2_abi
     inline void callProcessLegacy (Vst2::AEffect* e, float** in, float** out, Vst2::VstInt32 numFrames)
     {
         reinterpret_cast<ProcessLegacyMS> (e->process) (e, in, out, numFrames);
+    }
+
+    inline float callGetParameter (Vst2::AEffect* e, Vst2::VstInt32 index)
+    {
+        return reinterpret_cast<GetParameterMS> (e->getParameter) (e, index);
+    }
+
+    inline void callSetParameter (Vst2::AEffect* e, Vst2::VstInt32 index, float value)
+    {
+        reinterpret_cast<SetParameterMS> (e->setParameter) (e, index, value);
     }
 
     inline Vst2::AEffect* callMain (Vst2::AEffect* (*mainFn) (Vst2::audioMasterCallback), AudioMasterMS audioMaster)
@@ -1041,7 +1053,11 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
             {
                 const ScopedLock sl (pluginInstance.lock);
 
+               #if JUCE_VST2_WINELIB
+                return winelib_vst2_abi::callGetParameter (effect, getParameterIndex());
+               #else
                 return effect->getParameter (effect, getParameterIndex());
+               #endif
             }
 
             return 0.0f;
@@ -1053,8 +1069,13 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
             {
                 const ScopedLock sl (pluginInstance.lock);
 
+               #if JUCE_VST2_WINELIB
+                if (! approximatelyEqual (winelib_vst2_abi::callGetParameter (effect, getParameterIndex()), newValue))
+                    winelib_vst2_abi::callSetParameter (effect, getParameterIndex(), newValue);
+               #else
                 if (! approximatelyEqual (effect->getParameter (effect, getParameterIndex()), newValue))
                     effect->setParameter (effect, getParameterIndex(), newValue);
+               #endif
             }
         }
 
@@ -1479,32 +1500,45 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
 
         setRateAndBufferSizeDetails (initialSampleRate, initialBlockSize);
 
+        JUCE_VST_LOG ("[winelib:init] effIdentify");
         dispatch (Vst2::effIdentify, 0, 0, nullptr, 0);
 
         if (getSampleRate() > 0)
+        {
+            JUCE_VST_LOG ("[winelib:init] effSetSampleRate");
             dispatch (Vst2::effSetSampleRate, 0, 0, nullptr, (float) getSampleRate());
+        }
 
         if (getBlockSize() > 0)
+        {
+            JUCE_VST_LOG ("[winelib:init] effSetBlockSize");
             dispatch (Vst2::effSetBlockSize, 0, jmax (32, getBlockSize()), nullptr, 0);
+        }
 
+        JUCE_VST_LOG ("[winelib:init] effOpen");
         dispatch (Vst2::effOpen, 0, 0, nullptr, 0);
 
         setRateAndBufferSizeDetails (getSampleRate(), getBlockSize());
 
+        JUCE_VST_LOG ("[winelib:init] program setup (numPrograms=" + String (getNumPrograms()) + ")");
         if (getNumPrograms() > 1)
             setCurrentProgram (0);
         else
             dispatch (Vst2::effSetProgram, 0, 0, nullptr, 0);
 
+        JUCE_VST_LOG ("[winelib:init] connecting buses (in=" + String (vstEffect->numInputs) + " out=" + String (vstEffect->numOutputs) + ")");
         for (int i = vstEffect->numInputs;  --i >= 0;)  dispatch (Vst2::effConnectInput,  i, 1, nullptr, 0);
         for (int i = vstEffect->numOutputs; --i >= 0;)  dispatch (Vst2::effConnectOutput, i, 1, nullptr, 0);
 
+        JUCE_VST_LOG ("[winelib:init] updateStoredProgramNames");
         if (getVstCategory() != Vst2::kPlugCategShell) // (workaround for Waves 5 plugins which crash during this call)
             updateStoredProgramNames();
 
+        JUCE_VST_LOG ("[winelib:init] pluginCanDo + isSynth");
         wantsMidiMessages = pluginCanDo ("receiveVstMidiEvent") > 0 || isSynthPlugin();
 
         setLatencySamples (vstEffect->initialDelay);
+        JUCE_VST_LOG ("[winelib:init] initialise() complete");
     }
 
     void getExtensions (ExtensionsVisitor& visitor) const override
@@ -2461,6 +2495,14 @@ private:
             JUCE_VST_LOG ("[winelib] before callMain (moduleMain=" + String::toHexString ((pointer_sized_int) module->moduleMain) + ")");
             effect = winelib_vst2_abi::callMain (module->moduleMain, audioMaster);
             JUCE_VST_LOG ("[winelib] after callMain  -> effect=" + String::toHexString ((pointer_sized_int) effect));
+            if (effect != nullptr)
+                JUCE_VST_LOG ("[winelib] AEffect: magic=" + String::toHexString (effect->magic)
+                              + " numParams=" + String (effect->numParams)
+                              + " numPrograms=" + String (effect->numPrograms)
+                              + " numInputs=" + String (effect->numInputs)
+                              + " numOutputs=" + String (effect->numOutputs)
+                              + " flags=0x" + String::toHexString (effect->flags)
+                              + " initialDelay=" + String (effect->initialDelay));
            #else
             constexpr Vst2::audioMasterCallback audioMaster = [] (Vst2::AEffect* eff,
                                                                   Vst2::VstInt32 opcode,
