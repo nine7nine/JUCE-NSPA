@@ -81,7 +81,11 @@ public:
          #endif
           plugin (plug)
     {
-       #if JUCE_LINUX || JUCE_BSD
+       #if JUCE_VST2_WINELIB
+        // Winelib host: pluginWindow (X11) isn't used — the X11 reparent
+        // happens internally inside WineHWNDEmbedComponent.
+        ignoreUnused (pluginRefusesToResize, alreadyInside);
+       #elif JUCE_LINUX || JUCE_BSD
         pluginWindow = None;
         ignoreUnused (pluginRefusesToResize, alreadyInside);
        #elif JUCE_MAC
@@ -104,7 +108,7 @@ public:
         setOpaque (true);
         setVisible (true);
 
-       #if JUCE_WINDOWS
+       #if JUCE_WINDOWS || JUCE_VST2_WINELIB
         addAndMakeVisible (embeddedComponent);
        #endif
     }
@@ -182,6 +186,11 @@ public:
 
     void paint (Graphics& g) override
     {
+       #if JUCE_VST2_WINELIB
+        // Winelib host: WineHWNDEmbedComponent's X11 backing window
+        // handles its own repaints; we just paint our background.
+        g.fillAll (Colours::black);
+       #else
        #if JUCE_LINUX || JUCE_BSD
         if (isOpen)
         {
@@ -199,6 +208,7 @@ public:
         {
             g.fillAll (Colours::black);
         }
+       #endif
     }
 
     void componentMovedOrResized (bool /*wasMoved*/, bool /*wasResized*/) override
@@ -210,7 +220,9 @@ public:
         {
             const ScopedValueSetter<bool> recursiveResizeSetter (recursiveResize, true);
 
-           #if JUCE_WINDOWS
+           #if JUCE_WINDOWS || JUCE_VST2_WINELIB
+            // Winelib: WineHWNDEmbedComponent maps its bounds onto its
+            // X11 backing internally via Pimpl::componentMovedOrResized.
             embeddedComponent.setBounds (getLocalBounds());
            #elif JUCE_LINUX || JUCE_BSD
             const auto pos = componentToVstRect (*this, getLocalBounds());
@@ -322,7 +334,10 @@ public:
                 reentrantGuard = false;
             }
 
-           #if JUCE_LINUX || JUCE_BSD
+           #if JUCE_VST2_WINELIB
+            // Winelib host: WineHWNDEmbedComponent handles X11 child
+            // tracking internally; no need to chase pluginWindow.
+           #elif JUCE_LINUX || JUCE_BSD
             if (pluginWindow == 0)
             {
                 updatePluginWindowHandle();
@@ -431,6 +446,12 @@ private:
 
        #if JUCE_WINDOWS
         auto* handle = embeddedComponent.getHWND();
+       #elif JUCE_VST2_WINELIB
+        // Winelib host: pass the Wine HWND from WineHWNDEmbedComponent.
+        // X11 reparent under JUCE's peer happened in addAndMakeVisible
+        // (constructor); plugin sees an HWND it can attach to like on
+        // Windows.
+        auto* handle = embeddedComponent.getHWND();
        #else
         auto* handle = getWindowHandle();
        #endif
@@ -500,6 +521,23 @@ private:
                 }
             }
         }
+       #elif JUCE_VST2_WINELIB
+        // Winelib host: no X11 child to map — WineHWNDEmbedComponent
+        // owns its X11 backing and is already addAndMakeVisible'd
+        // (constructor + componentMovedOrResized handle bounds).
+        int w = 250, h = 150;
+
+        if (rect != nullptr)
+        {
+            w = rect->right - rect->left;
+            h = rect->bottom - rect->top;
+
+            if (w == 0 || h == 0)
+            {
+                w = 250;
+                h = 150;
+            }
+        }
        #elif JUCE_LINUX || JUCE_BSD
         updatePluginWindowHandle();
 
@@ -559,6 +597,10 @@ private:
             JUCE_END_IGNORE_WARNINGS_MSVC
 
             originalWndProc = nullptr;
+           #elif JUCE_VST2_WINELIB
+            // Winelib host: no per-plugin pluginWindow tracking, no
+            // Win32 WndProc hook — WineHWNDEmbedComponent owns its
+            // window and tears it down at destruction.
            #elif JUCE_LINUX || JUCE_BSD
             pluginWindow = 0;
            #endif
@@ -637,7 +679,7 @@ private:
     }
    #endif
 
-   #if JUCE_LINUX || JUCE_BSD
+   #if (JUCE_LINUX || JUCE_BSD) && ! JUCE_VST2_WINELIB
     void updatePluginWindowHandle()
     {
         pluginWindow = getChildWindow ((Window) getWindowHandle());
@@ -721,6 +763,15 @@ private:
      ViewComponent embeddedComponent;
      void* originalWndProc = {};
      int sizeCheckCount = 0;
+    #elif JUCE_VST2_WINELIB
+     // Winelib host: present a real HWND to the plugin.
+     // WineHWNDEmbedComponent reparents its X11 backing window under
+     // JUCE's peer when added to a desktop (see VST3PluginWindow's
+     // identical pattern in juce_VST3PluginFormat.cpp lines 569-575).
+     // Plugin sees an HWND; Element sees an X11 child it can lay out
+     // via setBounds().  No pluginWindow / X11 chasing here — the
+     // embed component owns its X11 backing internally.
+     WineHWNDEmbedComponent embeddedComponent;
     #elif JUCE_LINUX || JUCE_BSD
      ::Display* display = XWindowSystem::getInstance()->getDisplay();
      Window pluginWindow = 0;
