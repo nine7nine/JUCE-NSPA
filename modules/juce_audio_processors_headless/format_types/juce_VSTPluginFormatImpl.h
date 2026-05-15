@@ -1311,7 +1311,11 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
             {
                 wineDispatcher->run ([&]
                 {
-                    winelib_vst2_abi::callDispatcher (vstEffect, Vst2::effClose, 0, 0, nullptr, 0);
+                    try
+                    {
+                        winelib_vst2_abi::callDispatcher (vstEffect, Vst2::effClose, 0, 0, nullptr, 0);
+                    }
+                    catch (...) {}
                 });
             }
             else
@@ -1358,11 +1362,22 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
             BusesProperties ioConfig;
             wineDisp->run ([&]
             {
-                winelib_vst2_abi::callDispatcher (newEffect, Vst2::effIdentify, 0, 0, nullptr, 0);
-                winelib_vst2_abi::callDispatcher (newEffect, Vst2::effSetSampleRate, 0, 0, nullptr, static_cast<float> (initialSampleRate));
-                winelib_vst2_abi::callDispatcher (newEffect, Vst2::effSetBlockSize,  0, blockSize, nullptr, 0);
-                winelib_vst2_abi::callDispatcher (newEffect, Vst2::effOpen, 0, 0, nullptr, 0);
-                ioConfig = queryBusIO (newEffect);
+                try
+                {
+                    winelib_vst2_abi::callDispatcher (newEffect, Vst2::effIdentify, 0, 0, nullptr, 0);
+                    winelib_vst2_abi::callDispatcher (newEffect, Vst2::effSetSampleRate, 0, 0, nullptr, static_cast<float> (initialSampleRate));
+                    winelib_vst2_abi::callDispatcher (newEffect, Vst2::effSetBlockSize,  0, blockSize, nullptr, 0);
+                    winelib_vst2_abi::callDispatcher (newEffect, Vst2::effOpen, 0, 0, nullptr, 0);
+                    ioConfig = queryBusIO (newEffect);
+                }
+                catch (...)
+                {
+                    // Plugin init threw — leave newEffect partially
+                    // initialised but contained; the host will either
+                    // log a "failed to initialise" and discard, or
+                    // teardown via cleanup() which dispatches effClose
+                    // through the same worker.
+                }
             });
 
             auto instance = std::make_unique<TypeToCreate> (newModule, ioConfig, newEffect, initialSampleRate, blockSize);
@@ -2759,7 +2774,11 @@ private:
                 {
                     wineDispatcher->run ([&]
                     {
-                        winelib_vst2_abi::callDispatcher (vstEffect, Vst2::effProcessEvents, 0, 0, midiEventsToSend.events, 0);
+                        try
+                        {
+                            winelib_vst2_abi::callDispatcher (vstEffect, Vst2::effProcessEvents, 0, 0, midiEventsToSend.events, 0);
+                        }
+                        catch (...) {}
                     });
                 }
                 else
@@ -2827,25 +2846,36 @@ private:
         {
             wineDispatcher->run ([&]
             {
-                if ((vstEffect->flags & Vst2::effFlagsCanReplacing) != 0)
+                try
                 {
-                    winelib_vst2_abi::callProcessReplacing (vstEffect,
-                                                            tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
-                                                            tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer),
-                                                            sampleFrames);
+                    if ((vstEffect->flags & Vst2::effFlagsCanReplacing) != 0)
+                    {
+                        winelib_vst2_abi::callProcessReplacing (vstEffect,
+                                                                tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                                tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer),
+                                                                sampleFrames);
+                    }
+                    else
+                    {
+                        outOfPlaceBuffer.setSize (vstEffect->numOutputs, sampleFrames);
+                        outOfPlaceBuffer.clear();
+
+                        winelib_vst2_abi::callProcessLegacy (vstEffect,
+                                                             tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                             tempChannelPointers[1].getArrayOfModifiableWritePointers (outOfPlaceBuffer),
+                                                             sampleFrames);
+
+                        for (int i = vstEffect->numOutputs; --i >= 0;)
+                            buffer.copyFrom (i, 0, outOfPlaceBuffer.getReadPointer (i), sampleFrames);
+                    }
                 }
-                else
+                catch (...)
                 {
-                    outOfPlaceBuffer.setSize (vstEffect->numOutputs, sampleFrames);
-                    outOfPlaceBuffer.clear();
-
-                    winelib_vst2_abi::callProcessLegacy (vstEffect,
-                                                         tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
-                                                         tempChannelPointers[1].getArrayOfModifiableWritePointers (outOfPlaceBuffer),
-                                                         sampleFrames);
-
-                    for (int i = vstEffect->numOutputs; --i >= 0;)
-                        buffer.copyFrom (i, 0, outOfPlaceBuffer.getReadPointer (i), sampleFrames);
+                    // Plugin process() threw — quietly drop the block
+                    // rather than propagating the exception into
+                    // Element's audio engine (would terminate the
+                    // process under SCHED_FIFO@80).  Same shape as
+                    // dispatch()'s try/catch.
                 }
             });
             return;
@@ -2877,10 +2907,14 @@ private:
         {
             wineDispatcher->run ([&]
             {
-                winelib_vst2_abi::callProcessDoubleReplacing (vstEffect,
-                                                              tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
-                                                              tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer),
-                                                              sampleFrames);
+                try
+                {
+                    winelib_vst2_abi::callProcessDoubleReplacing (vstEffect,
+                                                                  tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                                  tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer),
+                                                                  sampleFrames);
+                }
+                catch (...) {}
             });
             return;
         }
