@@ -1323,27 +1323,35 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
             _fpreset(); // some dodgy plug-ins mess around with this
 
            #if JUCE_VST2_WINELIB
-            /* effClose on the per-instance worker so the plugin sees
-             * the same Win32 thread identity it had through init +
-             * audio.  vstModule->closeEffect is a no-op under
-             * JUCE_VST2_WINELIB (it sees peModule != nullptr and
-             * returns); we dispatch the close call here ourselves. */
-            if (wineDispatcher != nullptr)
+            /* effClose belongs in yabridge's unsafe_requests set —
+             * MUST run on the GUI/main thread (which has the Win32
+             * message pump), NOT on the per-instance worker.  cleanup()
+             * is already on the message thread via the
+             * MessageManager::callSync wrapper in
+             * ~VSTPluginInstanceHeadless, so we call inline.
+             *
+             * Routing through the worker would deadlock /
+             * access-violation for the same reason effEditOpen would
+             * — the plugin's PE-side effClose may destroy editor
+             * child windows / signal worker threads that need their
+             * messages pumped, and the worker thread has no
+             * PeekMessage loop while it's busy running the dispatch
+             * task.  Same lesson Phase 4.x for VST3 — IPlugView
+             * teardown runs on the UI thread by design.
+             *
+             * vstModule->closeEffect is a no-op under JUCE_VST2_WINELIB
+             * (it sees peModule != nullptr and returns); the close call
+             * is dispatched here instead. */
+            try
             {
-                wineDispatcher->run ([&]
-                {
-                    try
-                    {
-                        winelib_vst2_abi::callDispatcher (vstEffect, Vst2::effClose, 0, 0, nullptr, 0);
-                    }
-                    catch (...) {}
-                });
+                winelib_vst2_abi::callDispatcher (vstEffect, Vst2::effClose, 0, 0, nullptr, 0);
             }
-            else
-           #endif
+            catch (...) {}
+           #else
             {
                 vstModule->closeEffect (vstEffect);
             }
+           #endif
         }
 
         vstModule = nullptr;
@@ -2137,23 +2145,41 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
                     || opcode == Vst2::effSetBlockSize
                     || opcode == Vst2::effVendorSpecific;
 
-                if (runOnCallerThread)
-                    JUCE_VST_LOG ("[winelib:dispatch] opcode=" + String ((int) opcode) + " (inline, caller thread)");
+                /* Run inline on the caller thread — mirrors yabridge's
+                 * default in src/wine-host/bridges/vst2.cpp:655-658.
+                 * The previous design bounced every non-unsafe opcode
+                 * to a per-instance worker; that serializes 109×3+
+                 * post-init parameter queries (effGetParamLabel/
+                 * Display/Name × N params) and contends the same
+                 * worker that processReplacing also bounces through,
+                 * locking up the plugin during load.
+                 *
+                 * The `runOnCallerThread` set above is yabridge's
+                 * `unsafe_requests` — those opcodes still need the
+                 * UI/message thread because they touch CreateWindow,
+                 * the Win32 message loop, or COM apartment state.
+                 * When dispatch() is called from the message thread
+                 * for those (the typical case), this is already on
+                 * the right thread; when called from elsewhere
+                 * (rare), we'd need to MessageManager::callSync —
+                 * but we have no observed cases requiring that yet.
+                 *
+                 * For everything else, plugins do not require a
+                 * stable Win32 thread identity per yabridge's
+                 * production evidence across the entire VST2
+                 * ecosystem.  The per-instance worker remains in
+                 * `create()` for the moduleMain factory call where
+                 * u-he-style plugins DO stash thread identity
+                 * during init. */
+                if (opcode != Vst2::effEditIdle)
+                    JUCE_VST_LOG ("[winelib:dispatch] op=" + String ((int) opcode)
+                                    + " idx=" + String (index)
+                                    + (runOnCallerThread ? " (unsafe-inline)" : " (inline)"));
 
-                if (wineDispatcher != nullptr && ! runOnCallerThread)
-                {
-                    wineDispatcher->run ([&]
-                    {
-                        result = winelib_vst2_abi::callDispatcher (vstEffect, opcode, index, value, ptr, opt);
-                    });
-                }
-                else
-                {
-                    result = winelib_vst2_abi::callDispatcher (vstEffect, opcode, index, value, ptr, opt);
-                }
+                result = winelib_vst2_abi::callDispatcher (vstEffect, opcode, index, value, ptr, opt);
 
-                if (runOnCallerThread)
-                    JUCE_VST_LOG ("[winelib:dispatch] opcode=" + String ((int) opcode) + " returned " + String ((juce::int64) result));
+                if (opcode != Vst2::effEditIdle)
+                    JUCE_VST_LOG ("[winelib:dispatch] op=" + String ((int) opcode) + " -> " + String ((juce::int64) result));
                #else
                 {
                     result = vstEffect->dispatcher (vstEffect, opcode, index, value, ptr, opt);
@@ -2900,27 +2926,20 @@ private:
                                                jlimit (0, numSamples - 1, metadata.samplePosition));
 
                #if JUCE_VST2_WINELIB
-                /* effProcessEvents is a plugin call invoked on the
-                 * audio thread just before processReplacing.  Same
-                 * thread-identity + ABI rules apply — route through
-                 * the per-instance worker AND through the ms_abi
-                 * callDispatcher helper. */
-                if (wineDispatcher != nullptr)
+                /* effProcessEvents runs inline on the audio thread —
+                 * yabridge's MIDI path lives on the audio thread by
+                 * design (no worker bounce).  ms_abi cast still
+                 * applies for the PE boundary. */
+                try
                 {
-                    wineDispatcher->run ([&]
-                    {
-                        try
-                        {
-                            winelib_vst2_abi::callDispatcher (vstEffect, Vst2::effProcessEvents, 0, 0, midiEventsToSend.events, 0);
-                        }
-                        catch (...) {}
-                    });
+                    winelib_vst2_abi::callDispatcher (vstEffect, Vst2::effProcessEvents, 0, 0, midiEventsToSend.events, 0);
                 }
-                else
-               #endif
+                catch (...) {}
+               #else
                 {
                     vstEffect->dispatcher (vstEffect, Vst2::effProcessEvents, 0, 0, midiEventsToSend.events, 0);
                 }
+               #endif
             }
 
             _clearfp();
@@ -2966,57 +2985,48 @@ private:
     inline void invokeProcessFunction (AudioBuffer<float>& buffer, int32 sampleFrames)
     {
        #if JUCE_VST2_WINELIB
-        /* Audio hot path — dispatch to the per-instance Win32 worker so
-         * the plugin's process() runs with the same Win32 thread
-         * identity it had during effOpen / effSetSampleRate /
-         * effSetBlockSize.  Per-instance worker, so N VST2 instances
-         * across N JACK-callback dispatches run on N parallel workers
-         * (no global bottleneck).  Two FUTEX_*_PI hops on a PiMutex +
-         * PiCond pair from juce_winelib_pi_sync — the JACK thread's PI
-         * chain carries through the worker for the duration of
-         * process(), no inversion gap exists between dispatch and
-         * wake.  Same shape as VST3's processor->process dispatch in
-         * juce_VST3PluginFormatImpl.h. */
-        if (wineDispatcher != nullptr)
+        /* Audio hot path — run inline on Element's audio thread.  The
+         * earlier per-instance Win32 worker bounce gave a stable Win32
+         * thread identity to the plugin's process() call but added a
+         * pair of PiCond round-trips on EVERY audio block and shared
+         * its worker with the message thread's dispatch() bounce,
+         * which under contention (109+ post-init param queries +
+         * audio active) locks up plugin load entirely.  Yabridge's
+         * production VST2 model runs process() on a dedicated audio
+         * thread without bouncing.  In our in-process winelib model
+         * Element's audio callback IS that dedicated audio thread.
+         *
+         * ms_abi cast still applies for the PE boundary. */
+        try
         {
-            wineDispatcher->run ([&]
+            if ((vstEffect->flags & Vst2::effFlagsCanReplacing) != 0)
             {
-                try
-                {
-                    if ((vstEffect->flags & Vst2::effFlagsCanReplacing) != 0)
-                    {
-                        winelib_vst2_abi::callProcessReplacing (vstEffect,
-                                                                tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
-                                                                tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer),
-                                                                sampleFrames);
-                    }
-                    else
-                    {
-                        outOfPlaceBuffer.setSize (vstEffect->numOutputs, sampleFrames);
-                        outOfPlaceBuffer.clear();
+                winelib_vst2_abi::callProcessReplacing (vstEffect,
+                                                        tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                        tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer),
+                                                        sampleFrames);
+            }
+            else
+            {
+                outOfPlaceBuffer.setSize (vstEffect->numOutputs, sampleFrames);
+                outOfPlaceBuffer.clear();
 
-                        winelib_vst2_abi::callProcessLegacy (vstEffect,
-                                                             tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
-                                                             tempChannelPointers[1].getArrayOfModifiableWritePointers (outOfPlaceBuffer),
-                                                             sampleFrames);
+                winelib_vst2_abi::callProcessLegacy (vstEffect,
+                                                     tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                     tempChannelPointers[1].getArrayOfModifiableWritePointers (outOfPlaceBuffer),
+                                                     sampleFrames);
 
-                        for (int i = vstEffect->numOutputs; --i >= 0;)
-                            buffer.copyFrom (i, 0, outOfPlaceBuffer.getReadPointer (i), sampleFrames);
-                    }
-                }
-                catch (...)
-                {
-                    // Plugin process() threw — quietly drop the block
-                    // rather than propagating the exception into
-                    // Element's audio engine (would terminate the
-                    // process under SCHED_FIFO@80).  Same shape as
-                    // dispatch()'s try/catch.
-                }
-            });
-            return;
+                for (int i = vstEffect->numOutputs; --i >= 0;)
+                    buffer.copyFrom (i, 0, outOfPlaceBuffer.getReadPointer (i), sampleFrames);
+            }
         }
-       #endif
-
+        catch (...)
+        {
+            // Plugin process() threw — quietly drop the block rather
+            // than propagating into Element's audio engine (would
+            // terminate the process under SCHED_FIFO@80).
+        }
+       #else
         if ((vstEffect->flags & Vst2::effFlagsCanReplacing) != 0)
         {
             vstEffect->processReplacing (vstEffect, tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
@@ -3033,29 +3043,24 @@ private:
             for (int i = vstEffect->numOutputs; --i >= 0;)
                 buffer.copyFrom (i, 0, outOfPlaceBuffer.getReadPointer (i), sampleFrames);
         }
+       #endif
     }
 
     inline void invokeProcessFunction (AudioBuffer<double>& buffer, int32 sampleFrames)
     {
        #if JUCE_VST2_WINELIB
-        if (wineDispatcher != nullptr)
+        try
         {
-            wineDispatcher->run ([&]
-            {
-                try
-                {
-                    winelib_vst2_abi::callProcessDoubleReplacing (vstEffect,
-                                                                  tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
-                                                                  tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer),
-                                                                  sampleFrames);
-                }
-                catch (...) {}
-            });
-            return;
+            winelib_vst2_abi::callProcessDoubleReplacing (vstEffect,
+                                                          tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                          tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer),
+                                                          sampleFrames);
         }
-       #endif
+        catch (...) {}
+       #else
         vstEffect->processDoubleReplacing (vstEffect, tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
                                                       tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer), sampleFrames);
+       #endif
     }
 
     //==============================================================================
