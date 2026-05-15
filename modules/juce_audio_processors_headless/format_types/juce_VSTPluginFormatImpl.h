@@ -703,6 +703,16 @@ struct ModuleHandle final : public ReferenceCountedObject
 
             return false;
         }
+
+        /* Non-PE file under winelib: refuse cleanly.  JUCE's default
+         * Linux VST2 search paths (/usr/lib/vst, /usr/local/lib/vst,
+         * ~/.vst) often contain Linux-native `.so` plugins (Carla's
+         * fake-VST bundles like CarlaPatchbayFX.so are the canonical
+         * offender).  Falling through to module.open() below would
+         * dlopen them, which crashes the scanner on bundles that lie
+         * about their entry points.  A winelib Element host only
+         * makes sense for Windows PE plugins anyway. */
+        return false;
        #endif
 
         module.open (file.getFullPathName());

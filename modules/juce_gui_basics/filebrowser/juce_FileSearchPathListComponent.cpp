@@ -154,7 +154,19 @@ void FileSearchPathListComponent::deleteKeyPressed (int row)
 
 void FileSearchPathListComponent::returnKeyPressed (int row)
 {
+    /* Winelib (Element host): explicit useNativeBox=false to force
+     * JUCE's in-process NonNative chooser (FileBrowserComponent +
+     * FileChooserDialogBox) instead of spawning zenity/kdialog as a
+     * Linux child process.  The spawned dialog's X11 window doesn't
+     * reliably surface above Element's own Wine-x11drv windows, so
+     * the "+" / "Change..." buttons appear dead from the user's
+     * POV.  In-process NonNative renders into our window hierarchy
+     * and behaves predictably. */
+   #if defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
+    chooser = std::make_unique<FileChooser> (TRANS ("Change folder..."), path.getRawString (row), "*", false);
+   #else
     chooser = std::make_unique<FileChooser> (TRANS ("Change folder..."), path.getRawString (row), "*");
+   #endif
     auto chooserFlags = FileBrowserComponent::openMode | FileBrowserComponent::canSelectDirectories;
 
     chooser->launchAsync (chooserFlags, [this, row] (const FileChooser& fc)
@@ -231,7 +243,13 @@ void FileSearchPathListComponent::addPath()
     if (start == File())
         start = File::getCurrentWorkingDirectory();
 
+   #if defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
+    // See returnKeyPressed comment above — force in-process NonNative
+    // file picker under winelib.
+    chooser = std::make_unique<FileChooser> (TRANS ("Add a folder..."), start, "*", false);
+   #else
     chooser = std::make_unique<FileChooser> (TRANS ("Add a folder..."), start, "*");
+   #endif
     auto chooserFlags = FileBrowserComponent::openMode | FileBrowserComponent::canSelectDirectories;
 
     chooser->launchAsync (chooserFlags, [this] (const FileChooser& fc)
