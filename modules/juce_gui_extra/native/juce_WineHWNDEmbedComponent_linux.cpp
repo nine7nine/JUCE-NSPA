@@ -341,7 +341,7 @@ public:
         const int w = jmax (1, area.getWidth());
         const int h = jmax (1, area.getHeight());
 
-        syncHwndScreenPosition (w, h);
+        syncHwndScreenPosition (area.getX(), area.getY(), w, h);
     }
 
     using ComponentMovementWatcher::componentMovedOrResized;
@@ -445,22 +445,39 @@ private:
     //   SubstructureRedirect is needed because override_redirect on
     //   wine_x11_window (set by Wine for unmanaged popups) makes our
     //   move pass through immediately.
-    void syncHwndScreenPosition (int w, int h) noexcept
+    void syncHwndScreenPosition (int peerX, int peerY, int w, int h) noexcept
     {
         if (hwnd == nullptr || display == nullptr || wineX11Window == 0)
             return;
 
-        // Absolute screen position = wineX11Window's current root-relative
-        // position (which is peer_screen + area, since we've reparented
-        // under peer and currently sit at (0,0) in peer).  We query rather
-        // than compute from JUCE bounds so the answer is anchored to what
-        // X11 actually says, not what we expect.
-        int absX = 0, absY = 0;
+        // Absolute screen position = peer's screen origin + (peerX, peerY).
+        // We translate the PEER X11 window's (0, 0) to root to get peer's
+        // screen origin, then add peerX, peerY for our area inside it.
+        //
+        // Earlier this function queried wine_x11_window's own root-
+        // relative position and assumed wine_x11_window sat at peer's
+        // origin (0, 0) — that only held when the WineHWNDEmbedComponent
+        // covered the entire peer.  Once Element wraps the editor with
+        // its PluginWindowContent (24px toolbar at top), the JUCE
+        // component lives at peer-relative (0, 26+), and pinning the
+        // wine X11 child to peer (0, 0) covered the toolbar and left
+        // the bottom 24+px of the host window as exposed backing.
+        auto* topLevel = owner.getTopLevelComponent();
+        if (topLevel == nullptr) return;
+        auto* peer = topLevel->getPeer();
+        if (peer == nullptr) return;
+        const Window parentX11 = (Window) (uintptr_t) peer->getNativeHandle();
+        if (parentX11 == 0) return;
+
+        int peerAbsX = 0, peerAbsY = 0;
         Window childReturn = 0;
         if (! X11Symbols::getInstance()->xTranslateCoordinates (
-                display, wineX11Window, DefaultRootWindow (display),
-                0, 0, &absX, &absY, &childReturn))
+                display, parentX11, DefaultRootWindow (display),
+                0, 0, &peerAbsX, &peerAbsY, &childReturn))
             return;
+
+        const int absX = peerAbsX + peerX;
+        const int absY = peerAbsY + peerY;
 
         const WineUINT flags = WINE_SWP_NOACTIVATE
                              | WINE_SWP_NOZORDER
@@ -470,12 +487,13 @@ private:
         // (1) Update Wine's WND rect.
         SetWindowPos (hwnd, nullptr, absX, absY, w, h, flags);
 
-        // (2) Pin wine_x11_window back to (0, 0, w, h) within peer's X11
-        //     window.  Wine's pSetWindowPos response (XConfigureWindow
+        // (2) Pin wine_x11_window to (peerX, peerY, w, h) within peer's
+        //     X11 window.  Wine's pSetWindowPos response (XConfigureWindow
         //     with abs coords) would otherwise leave it at the wrong X11
-        //     position.
+        //     position because the X server reads those coords as
+        //     parent-relative.
         auto* x = X11Symbols::getInstance();
-        x->xMoveResizeWindow (display, wineX11Window, 0, 0, w, h);
+        x->xMoveResizeWindow (display, wineX11Window, peerX, peerY, w, h);
         x->xFlush (display);
 
         lastAbsX    = absX;
@@ -497,6 +515,10 @@ private:
         auto* peer = topLevel->getPeer();
         if (peer == nullptr) return;
 
+        // wine_x11_window's current root-relative position = peer.abs +
+        // area (since we've reparented under peer and pinned to peerX,
+        // peerY).  Comparing it to lastAbsX/Y catches host moves where
+        // peer.abs changes but JUCE-space area does not.
         int absX = 0, absY = 0;
         Window childReturn = 0;
         if (! X11Symbols::getInstance()->xTranslateCoordinates (
@@ -512,13 +534,13 @@ private:
         const int h = jmax (1, area.getHeight());
 
         // Same correction dance as in syncHwndScreenPosition — except the
-        // bounds haven't actually changed in JUCE-space, only on screen.
+        // peer-relative area hasn't changed in JUCE-space, only on screen.
         SetWindowPos (hwnd, nullptr, absX, absY, w, h,
                       WINE_SWP_NOACTIVATE | WINE_SWP_NOZORDER
                       | WINE_SWP_NOOWNERZORDER | WINE_SWP_DEFERERASE);
 
         auto* x = X11Symbols::getInstance();
-        x->xMoveResizeWindow (display, wineX11Window, 0, 0, w, h);
+        x->xMoveResizeWindow (display, wineX11Window, area.getX(), area.getY(), w, h);
         x->xFlush (display);
 
         lastAbsX    = absX;
