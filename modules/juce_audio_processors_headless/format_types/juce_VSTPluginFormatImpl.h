@@ -93,6 +93,25 @@ JUCE_BEGIN_IGNORE_DEPRECATION_WARNINGS
 namespace juce
 {
 
+/* winelib patch: when building under winegcc (`__WINE__` defined) on
+ * Linux, detect Windows PE VST2 plugins and load them via Wine's
+ * `LoadLibraryW` instead of dlopen.  All per-instance plugin entry
+ * points (factory `moduleMain`, then every `dispatcher(opcode, ...)`
+ * call) marshal onto a per-instance Win32 worker so the plugin sees
+ * one stable Win32 thread identity for its entire lifetime — same
+ * pattern Phase 4 introduced for VST3 hosting (see commit fc363bb +
+ * juce_VST3PluginFormatImpl.h).  Vst2::audioMasterCallback runs on
+ * whatever thread the plugin chooses (already inside the worker), so
+ * we do NOT route the host-callback path. */
+#if JUCE_LINUX && defined (__WINE__)
+ #define JUCE_VST2_WINELIB 1
+#endif
+
+#if JUCE_VST2_WINELIB
+#include "juce_winelib_path.h"
+#include "juce_winelib_dispatch.h"
+#endif
+
 //==============================================================================
 namespace
 {
@@ -629,6 +648,13 @@ struct ModuleHandle final : public ReferenceCountedObject
 
   #if JUCE_WINDOWS || JUCE_LINUX || JUCE_BSD || JUCE_ANDROID
     DynamicLibrary module;
+   #if JUCE_VST2_WINELIB
+    /* Win32 PE module handle from LoadLibraryW (separate from `module`
+     * which is the dlopen path).  When this is non-null the plugin was
+     * loaded as a Windows PE binary via Wine; close() must FreeLibrary
+     * it instead of letting DynamicLibrary's dlclose run. */
+    void* peModule = nullptr;
+   #endif
 
     bool open()
     {
@@ -636,6 +662,48 @@ struct ModuleHandle final : public ReferenceCountedObject
             return true;
 
         pluginName = file.getFileNameWithoutExtension();
+
+       #if JUCE_VST2_WINELIB
+        /* Detect Windows PE binaries by their "MZ" magic and load them
+         * via LoadLibraryW.  Linux-native .so files fall through to the
+         * dlopen path below.  Single PE load per DLL — globalWineDispatcher
+         * ensures DllMain runs on a Win32 thread (PROCESS_ATTACH may
+         * itself spawn boost::thread RT workers, which need an RT-capable
+         * parent — see yabridge::nspa::set_thread_time_critical).  Per-
+         * instance dispatchers (one per VSTPluginInstanceHeadless) carry
+         * the per-instance state from here onwards. */
+        if (winelib_is_pe_file (file))
+        {
+            const String dosPath = winelib_unix_to_dos_path (file.getFullPathName());
+            winelib_log ("[vst2:ModuleHandle::open] DOS path '%s'", dosPath.toRawUTF8());
+            const auto widePath = winelib_path_to_utf16 (dosPath);
+
+            globalWineDispatcher().run ([&] { peModule = LoadLibraryW (widePath.getData()); });
+            winelib_log ("[vst2:ModuleHandle::open] LoadLibraryW -> %p", peModule);
+
+            if (peModule != nullptr)
+            {
+                moduleMain = (MainCall) GetProcAddress (peModule, "VSTPluginMain");
+                if (moduleMain == nullptr)
+                    moduleMain = (MainCall) GetProcAddress (peModule, "main");
+
+                winelib_log ("[vst2:ModuleHandle::open] entry point '%s' -> %p",
+                             moduleMain ? "found" : "missing", (void*) moduleMain);
+
+                if (moduleMain == nullptr)
+                {
+                    FreeLibrary (peModule);
+                    peModule = nullptr;
+                    return false;
+                }
+
+                vstXml = parseXML (file.withFileExtension ("vstxml"));
+                return true;
+            }
+
+            return false;
+        }
+       #endif
 
         module.open (file.getFullPathName());
 
@@ -663,11 +731,32 @@ struct ModuleHandle final : public ReferenceCountedObject
     {
         _fpreset(); // (doesn't do any harm)
 
+       #if JUCE_VST2_WINELIB
+        if (peModule != nullptr)
+        {
+            globalWineDispatcher().run ([&] { FreeLibrary (peModule); });
+            peModule = nullptr;
+            return;
+        }
+       #endif
+
         module.close();
     }
 
     void closeEffect (Vst2::AEffect* eff)
     {
+       #if JUCE_VST2_WINELIB
+        /* effClose is a plugin call — must run on the per-instance
+         * Win32 worker for thread-identity consistency with everything
+         * else the instance dispatched.  The instance owns the worker
+         * and dispatches its own effClose via its destructor path
+         * (see VSTPluginInstanceHeadless::cleanup), so here we just
+         * skip — the dispatcher has already done it.  Reached only on
+         * the non-Wine path when called from the standalone code path
+         * that does not own a per-instance dispatcher. */
+        if (peModule != nullptr)
+            return;
+       #endif
         eff->dispatcher (eff, Vst2::effClose, 0, 0, nullptr, 0);
     }
 
@@ -1091,6 +1180,23 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
         setHostedParameterTree (std::move (newParameterTree));
     }
 
+   #if JUCE_VST2_WINELIB
+    /* Per-instance Win32 worker — see Phase 4 VST3 commit fc363bb +
+     * juce_VST3PluginFormatImpl.h for the same pattern.  Allocated by
+     * `create()` BEFORE the AEffect is built (so `moduleMain`, the
+     * VST2 factory call, runs on this worker), then transferred into
+     * the constructed instance.  Every per-instance plugin call
+     * (`vstEffect->dispatcher(...)`, `processReplacing`, etc.) goes
+     * through `wineDispatcher->run(...)`, giving the plugin one
+     * stable Win32 thread identity for its whole lifetime.
+     *
+     * Lifetime: outlives `cleanup()`'s effClose dispatch (and any
+     * plugin-internal teardown it triggers) because it's destructed
+     * AFTER cleanup() returns in `~VSTPluginInstanceHeadless`.
+     */
+    std::unique_ptr<WineWin32Dispatcher> wineDispatcher;
+   #endif
+
     ~VSTPluginInstanceHeadless() override
     {
         if (vstEffect != nullptr && vstEffect->magic == 0x56737450 /* 'VstP' */)
@@ -1111,7 +1217,24 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
 
             _fpreset(); // some dodgy plug-ins mess around with this
 
-            vstModule->closeEffect (vstEffect);
+           #if JUCE_VST2_WINELIB
+            /* effClose on the per-instance worker so the plugin sees
+             * the same Win32 thread identity it had through init +
+             * audio.  vstModule->closeEffect is a no-op under
+             * JUCE_VST2_WINELIB (it sees peModule != nullptr and
+             * returns); we dispatch the close call here ourselves. */
+            if (wineDispatcher != nullptr)
+            {
+                wineDispatcher->run ([&]
+                {
+                    vstEffect->dispatcher (vstEffect, Vst2::effClose, 0, 0, nullptr, 0);
+                });
+            }
+            else
+           #endif
+            {
+                vstModule->closeEffect (vstEffect);
+            }
         }
 
         vstModule = nullptr;
@@ -1123,6 +1246,48 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
                                                  double initialSampleRate,
                                                  int initialBlockSize)
     {
+       #if JUCE_VST2_WINELIB
+        /* Allocate the per-instance Win32 worker BEFORE the AEffect is
+         * built — the plugin's factory entry (`moduleMain`, invoked
+         * inside `constructEffect`) returns the AEffect, and that call
+         * MUST happen on the same Win32 thread that later runs every
+         * `dispatcher(opcode, ...)` and `processReplacing` call.
+         * Plugins (u-he in particular) stash internal CRITICAL_SECTION
+         * owner state during the factory call; calling later with a
+         * different Win32 thread would trip thread-affinity assertions
+         * and ExitProcess.  See Phase 4 VST3 commit fc363bb for the
+         * identical pattern on the VST3 side. */
+        auto wineDisp = std::make_unique<WineWin32Dispatcher>();
+
+        Vst2::AEffect* newEffect = nullptr;
+        wineDisp->run ([&] { newEffect = constructEffect (newModule); });
+
+        if (newEffect != nullptr)
+        {
+            newEffect->resvd2 = 0;
+            auto blockSize = jmax (32, initialBlockSize);
+
+            /* All four init opcodes run as a single dispatched unit so
+             * the plugin's state-machine progresses on one stable Win32
+             * context with no inter-call jitter through the worker's
+             * task queue. */
+            BusesProperties ioConfig;
+            wineDisp->run ([&]
+            {
+                newEffect->dispatcher (newEffect, Vst2::effIdentify, 0, 0, nullptr, 0);
+                newEffect->dispatcher (newEffect, Vst2::effSetSampleRate, 0, 0, nullptr, static_cast<float> (initialSampleRate));
+                newEffect->dispatcher (newEffect, Vst2::effSetBlockSize,  0, blockSize, nullptr, 0);
+                newEffect->dispatcher (newEffect, Vst2::effOpen, 0, 0, nullptr, 0);
+                ioConfig = queryBusIO (newEffect);
+            });
+
+            auto instance = std::make_unique<TypeToCreate> (newModule, ioConfig, newEffect, initialSampleRate, blockSize);
+            instance->wineDispatcher = std::move (wineDisp);
+            return instance;
+        }
+
+        return nullptr;
+       #else
         if (auto* newEffect = constructEffect (newModule))
         {
             newEffect->resvd2 = 0;
@@ -1141,6 +1306,7 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
         }
 
         return nullptr;
+       #endif
     }
 
     //==============================================================================
@@ -1716,7 +1882,29 @@ struct VSTPluginInstanceHeadless : public AudioPluginInstance
                     UseResFile (vstModule->resFileId);
                #endif
 
-                result = vstEffect->dispatcher (vstEffect, opcode, index, value, ptr, opt);
+               #if JUCE_VST2_WINELIB
+                /* Per-instance Win32 worker: every plugin-touching
+                 * dispatcher() call must run on the same Win32 thread
+                 * that ran the factory / effOpen / effSetSampleRate /
+                 * effSetBlockSize (see `create()`).  Plugins stash
+                 * thread-affinity state in their internal
+                 * CRITICAL_SECTIONs; mismatched callers trip
+                 * ExitProcess assertions.  Self-dispatch guard inside
+                 * `run()` lets the host callback chain (which lands
+                 * back here from inside a plugin call) execute inline
+                 * on the worker without re-queueing. */
+                if (wineDispatcher != nullptr)
+                {
+                    wineDispatcher->run ([&]
+                    {
+                        result = vstEffect->dispatcher (vstEffect, opcode, index, value, ptr, opt);
+                    });
+                }
+                else
+               #endif
+                {
+                    result = vstEffect->dispatcher (vstEffect, opcode, index, value, ptr, opt);
+                }
 
                #if JUCE_MAC
                 auto newResFile = CurResFile();
@@ -2408,7 +2596,23 @@ private:
                     midiEventsToSend.addEvent (metadata.data, metadata.numBytes,
                                                jlimit (0, numSamples - 1, metadata.samplePosition));
 
-                vstEffect->dispatcher (vstEffect, Vst2::effProcessEvents, 0, 0, midiEventsToSend.events, 0);
+               #if JUCE_VST2_WINELIB
+                /* effProcessEvents is a plugin call invoked on the
+                 * audio thread just before processReplacing.  Same
+                 * thread-identity rule applies — route through the
+                 * per-instance worker. */
+                if (wineDispatcher != nullptr)
+                {
+                    wineDispatcher->run ([&]
+                    {
+                        vstEffect->dispatcher (vstEffect, Vst2::effProcessEvents, 0, 0, midiEventsToSend.events, 0);
+                    });
+                }
+                else
+               #endif
+                {
+                    vstEffect->dispatcher (vstEffect, Vst2::effProcessEvents, 0, 0, midiEventsToSend.events, 0);
+                }
             }
 
             _clearfp();
@@ -2453,6 +2657,43 @@ private:
     //==============================================================================
     inline void invokeProcessFunction (AudioBuffer<float>& buffer, int32 sampleFrames)
     {
+       #if JUCE_VST2_WINELIB
+        /* Audio hot path — dispatch to the per-instance Win32 worker so
+         * the plugin's process() runs with the same Win32 thread
+         * identity it had during effOpen / effSetSampleRate /
+         * effSetBlockSize.  Per-instance worker, so N VST2 instances
+         * across N JACK-callback dispatches run on N parallel workers
+         * (no global bottleneck).  Two FUTEX_*_PI hops on a PiMutex +
+         * PiCond pair from juce_winelib_pi_sync — the JACK thread's PI
+         * chain carries through the worker for the duration of
+         * process(), no inversion gap exists between dispatch and
+         * wake.  Same shape as VST3's processor->process dispatch in
+         * juce_VST3PluginFormatImpl.h. */
+        if (wineDispatcher != nullptr)
+        {
+            wineDispatcher->run ([&]
+            {
+                if ((vstEffect->flags & Vst2::effFlagsCanReplacing) != 0)
+                {
+                    vstEffect->processReplacing (vstEffect, tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                            tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer), sampleFrames);
+                }
+                else
+                {
+                    outOfPlaceBuffer.setSize (vstEffect->numOutputs, sampleFrames);
+                    outOfPlaceBuffer.clear();
+
+                    vstEffect->process (vstEffect, tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                   tempChannelPointers[1].getArrayOfModifiableWritePointers (outOfPlaceBuffer), sampleFrames);
+
+                    for (int i = vstEffect->numOutputs; --i >= 0;)
+                        buffer.copyFrom (i, 0, outOfPlaceBuffer.getReadPointer (i), sampleFrames);
+                }
+            });
+            return;
+        }
+       #endif
+
         if ((vstEffect->flags & Vst2::effFlagsCanReplacing) != 0)
         {
             vstEffect->processReplacing (vstEffect, tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
@@ -2473,6 +2714,17 @@ private:
 
     inline void invokeProcessFunction (AudioBuffer<double>& buffer, int32 sampleFrames)
     {
+       #if JUCE_VST2_WINELIB
+        if (wineDispatcher != nullptr)
+        {
+            wineDispatcher->run ([&]
+            {
+                vstEffect->processDoubleReplacing (vstEffect, tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
+                                                              tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer), sampleFrames);
+            });
+            return;
+        }
+       #endif
         vstEffect->processDoubleReplacing (vstEffect, tempChannelPointers[0].getArrayOfModifiableWritePointers (buffer),
                                                       tempChannelPointers[1].getArrayOfModifiableWritePointers (buffer), sampleFrames);
     }
