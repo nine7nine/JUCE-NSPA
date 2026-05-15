@@ -115,6 +115,13 @@ bool VSTPluginFormatHeadless::fileMightContainThisPluginType (const String& file
     return f.isDirectory() && f.hasFileExtension (".vst");
   #elif JUCE_WINDOWS
     return f.existsAsFile() && f.hasFileExtension (".dll");
+  #elif (JUCE_LINUX || JUCE_BSD) && defined (__WINE__)
+    /* Winelib host: scan for Windows-PE VST2 plugins (.dll) — that's
+     * the whole point of this build.  Linux-native .so plugins would
+     * be loaded via dlopen by JUCE's non-PE fallback path which we've
+     * disabled in ModuleHandle::open (it crashes on Carla-style
+     * bundles) — so don't even surface .so files to the scanner. */
+    return f.existsAsFile() && f.hasFileExtension (".dll");
   #elif JUCE_LINUX || JUCE_BSD || JUCE_ANDROID
     return f.existsAsFile() && f.hasFileExtension (".so");
   #endif
