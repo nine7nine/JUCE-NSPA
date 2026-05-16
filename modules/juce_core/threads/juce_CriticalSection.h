@@ -122,6 +122,14 @@ private:
     #else
      alignas (8) std::byte lock[24];
     #endif
+   #elif defined (__WINE__)
+    // librtpi-backed recursive PI mutex.  Direct FUTEX_LOCK_PI — no
+    // Wine ntdll surface, no wineserver.  Same kernel mechanism as
+    // glibc's PTHREAD_PRIO_INHERIT path but without the per-op
+    // user-space tax (TEB lookup, CS struct bookkeeping, SpinCount
+    // loop).  NSPA_RTPI_MUTEX_RECURSIVE matches juce::CriticalSection's
+    // recursive contract.  See modules/juce_core/native/juce_winelib_rtpi.h.
+    mutable pi_mutex_t lock;
    #else
     mutable pthread_mutex_t lock;
    #endif

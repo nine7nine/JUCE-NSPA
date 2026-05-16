@@ -48,7 +48,12 @@
 #include <functional>
 #include <thread>
 
-#include "juce_winelib_pi_sync.h"
+/* PiMutex / PiCond come from juce_core/native/juce_winelib_pi_sync.h,
+ * which juce_core.h pulls into the juce namespace under __WINE__ —
+ * see juce_core.h. No explicit include needed here; the module
+ * umbrella has already brought it in by the time this header is
+ * textually included from juce_VSTPluginFormatImpl.h /
+ * juce_VST3PluginFormatImpl.h. */
 
 extern "C" {
     /* Inline declarations — avoids pulling <windows.h>, which would

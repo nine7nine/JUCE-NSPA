@@ -60,6 +60,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <ctime>
 #include <stdexcept>
 #include <system_error>
 
@@ -182,6 +184,37 @@ public:
         const int err = pi_cond_wait (&c_, mutex.native_handle());
         if (err != 0)
             throw std::system_error (err, std::system_category(), "pi_cond_wait");
+    }
+
+    // Timed variant of wait().  Same lock contract.  Returns true if
+    // signalled, false on timeout.  Uses CLOCK_MONOTONIC (the default
+    // clock for FUTEX_WAIT_REQUEUE_PI when RTPI_COND_CLOCK_REALTIME is
+    // not set on the cond) — matches std::condition_variable::wait_for
+    // and JUCE upstream WaitableEvent semantics, and is robust to
+    // wall-clock jumps.  Spurious wakes can occur — wrap in a
+    // predicate loop.
+    template <class Rep, class Period>
+    bool timed_wait (PiMutex& mutex, const std::chrono::duration<Rep, Period>& rel_time)
+    {
+        struct timespec abstime;
+        clock_gettime (CLOCK_MONOTONIC, &abstime);
+
+        const auto ns_total = std::chrono::duration_cast<std::chrono::nanoseconds> (rel_time).count();
+        if (ns_total > 0)
+        {
+            abstime.tv_sec  += static_cast<time_t> (ns_total / 1'000'000'000LL);
+            abstime.tv_nsec += static_cast<long>   (ns_total % 1'000'000'000LL);
+            if (abstime.tv_nsec >= 1'000'000'000L)
+            {
+                abstime.tv_sec  += 1;
+                abstime.tv_nsec -= 1'000'000'000L;
+            }
+        }
+
+        const int err = pi_cond_timedwait (&c_, mutex.native_handle(), &abstime);
+        if (err == 0)         return true;
+        if (err == ETIMEDOUT) return false;
+        throw std::system_error (err, std::system_category(), "pi_cond_timedwait");
     }
 
     // Wake exactly one waiter.  The woken thread is requeued onto the

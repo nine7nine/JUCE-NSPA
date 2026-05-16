@@ -35,6 +35,14 @@
 namespace juce
 {
 
+#if defined (__WINE__)
+// librtpi-backed recursive PI mutex — see juce_CriticalSection.h.
+CriticalSection::CriticalSection() noexcept        { pi_mutex_init (&lock, NSPA_RTPI_MUTEX_RECURSIVE); }
+CriticalSection::~CriticalSection() noexcept       { pi_mutex_destroy (&lock); }
+void CriticalSection::enter() const noexcept       { pi_mutex_lock (&lock); }
+bool CriticalSection::tryEnter() const noexcept    { return pi_mutex_trylock (&lock) == 0; }
+void CriticalSection::exit() const noexcept        { pi_mutex_unlock (&lock); }
+#else
 CriticalSection::CriticalSection() noexcept
 {
     pthread_mutexattr_t atts;
@@ -51,6 +59,7 @@ CriticalSection::~CriticalSection() noexcept        { pthread_mutex_destroy (&lo
 void CriticalSection::enter() const noexcept        { pthread_mutex_lock (&lock); }
 bool CriticalSection::tryEnter() const noexcept     { return pthread_mutex_trylock (&lock) == 0; }
 void CriticalSection::exit() const noexcept         { pthread_mutex_unlock (&lock); }
+#endif
 
 //==============================================================================
 void JUCE_CALLTYPE Thread::sleep (int millisecs)

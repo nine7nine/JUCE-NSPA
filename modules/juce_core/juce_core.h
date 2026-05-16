@@ -269,6 +269,17 @@ JUCE_END_IGNORE_WARNINGS_MSVC
 #include "memory/juce_Singleton.h"
 #include "memory/juce_WeakReference.h"
 #include "threads/juce_ScopedLock.h"
+#if defined (__WINE__)
+ /* librtpi-backed PiMutex / PiCond must be in scope before any JUCE
+  * sync primitive that uses them under the __WINE__ build path:
+  *   juce::CriticalSection  → pi_mutex_t (NSPA_RTPI_MUTEX_RECURSIVE)
+  *   juce::SpinLock         → pi_mutex_t
+  *   juce::WaitableEvent    → PiMutex + PiCond
+  * The header is namespace-absorbing (designed to be #included inside
+  * an already-open namespace), so PiMutex / PiCond / PiShared end up
+  * as juce::PiMutex etc. */
+ #include "native/juce_winelib_pi_sync.h"
+#endif
 #include "threads/juce_CriticalSection.h"
 #include "maths/juce_Range.h"
 #include "maths/juce_NormalisableRange.h"
