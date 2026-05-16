@@ -62,11 +62,13 @@ inline bool winelib_is_pe_file (const File& f)
  * path", and crash downstream when they try to load related resources
  * (preset banks, midi-assign tables, etc.) relative to their binary.
  *
- * Ported from yabridge's src/wine-host/utils.cpp::to_dos_path()
- * (Robbert van der Helm, GPL-3).  We use only the manual-dosdevices
- * fallback path because Wine's `wine_get_dos_file_name()` empirically
- * only canonicalizes `.dll/.exe/.sys/.drv` extensions — for `.vst3`
- * (our case) it returns the unusable `\\?\\unix\\...` form.
+ * My own implementation of the dosdevices walk; I added the same
+ * DOS-path helper to yabridge-nspa as `nspa: helpers for
+ * RT-entitled module load + DOS-path conversion` (7fa8ef43).  We use
+ * only the manual-dosdevices path because Wine's
+ * `wine_get_dos_file_name()` empirically only canonicalizes
+ * `.dll/.exe/.sys/.drv` extensions — for `.vst3` (our case) it
+ * returns the unusable `\\?\\unix\\...` form.
  *
  * Walks $WINEPREFIX/dosdevices/ for drive-letter symlinks (X:), finds
  * the one whose target is the longest unix prefix of unixPath, and

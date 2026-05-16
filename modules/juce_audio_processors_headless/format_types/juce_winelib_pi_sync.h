@@ -3,9 +3,11 @@
  * juce_winelib_pi_sync.h — C++ RAII wrappers over the vendored librtpi
  * primitives in juce_winelib_rtpi.h.
  *
- * Mirrors the shape of yabridge's src/common/pi_sync.h (PiMutex / PiCond
- * in `yabridge::nspa`).  Both process-private and process-shared modes
- * are supported:
+ * Same C++ RAII wrapper shape I authored for yabridge-nspa as
+ * `nspa: PiMutex / PiCond C++ RAII wrappers` (191ab148).  The
+ * wrappers themselves originated in my Wine-NSPA work over librtpi
+ * and were carried into yabridge and now JUCE on the same shape.
+ * Both process-private and process-shared modes are supported:
  *
  *   PiMutex()             — process-private (FUTEX_LOCK_PI_PRIVATE)
  *   PiMutex(PiShared{})   — process-shared  (FUTEX_LOCK_PI), suitable
@@ -16,7 +18,7 @@
  * The in-process JUCE host only needs the private flavour today, but
  * keeping shmem support adds zero runtime cost (a flag bit) and leaves
  * the door open for an Element ↔ winelib boundary swap to PI shmem
- * rendezvous later — same surface yabridge uses for its L2 audio path.
+ * rendezvous later — same surface my yabridge-nspa L2 audio path uses.
  *
  * Why these wrappers rather than std::mutex / std::condition_variable:
  *
