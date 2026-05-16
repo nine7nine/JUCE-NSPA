@@ -372,6 +372,23 @@ public:
         const int w = jmax (1, area.getWidth());
         const int h = jmax (1, area.getHeight());
 
+        // Bisect: skip SetWindowPos when peer-relative area is
+        // unchanged.  JUCE event-loop noise can fire spurious
+        // componentMovedOrResized events (e.g., during a knob drag
+        // when the user is interacting with the plugin GUI), each of
+        // which would re-run SetWindowPos → Wine WND-rect update.
+        // The plugin's GetWindowRect-based cursor save/restore math
+        // assumes WND rect is stable during the click → drag →
+        // release window; a mid-drag WND rect update introduces a
+        // round-trip offset that lands SetCursorPos at the wrong
+        // screen coords.
+        if (lastSyncArea.getX() == area.getX()
+            && lastSyncArea.getY() == area.getY()
+            && lastSyncArea.getWidth() == w
+            && lastSyncArea.getHeight() == h)
+            return;
+
+        lastSyncArea = juce::Rectangle<int> (area.getX(), area.getY(), w, h);
         syncHwndScreenPosition (area.getX(), area.getY(), w, h);
     }
 
@@ -616,6 +633,12 @@ private:
     int          lastAbsX      = 0;
     int          lastAbsY      = 0;
     bool         haveLastAbs   = false;
+
+    // Cache of the last peer-relative area we synced via
+    // syncHwndScreenPosition.  Used to suppress redundant SetWindowPos
+    // calls from spurious JUCE event-loop componentMovedOrResized
+    // fires that don't reflect a real bounds change.
+    juce::Rectangle<int> lastSyncArea = { -1, -1, 0, 0 };
 
     // Drag-settle detection: stableCount counts consecutive no-motion
     // poll ticks; pendingSync is set when host motion is observed and
