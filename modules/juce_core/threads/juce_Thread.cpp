@@ -345,6 +345,12 @@ bool Thread::launch (Priority priority, std::function<void()> functionToRun)
 //==============================================================================
 void SpinLock::enter() const noexcept
 {
+   #if defined (__WINE__)
+    /* librtpi PI mutex — blocks under FUTEX_LOCK_PI rather than spinning.
+     * See juce_SpinLock.h for the rationale (SCHED_FIFO same-prio
+     * starvation under the upstream spin-yield loop). */
+    pi_mutex_lock (&lock);
+   #else
     if (! tryEnter())
     {
         for (int i = 20; --i >= 0;)
@@ -354,6 +360,7 @@ void SpinLock::enter() const noexcept
         while (! tryEnter())
             Thread::yield();
     }
+   #endif
 }
 
 //==============================================================================

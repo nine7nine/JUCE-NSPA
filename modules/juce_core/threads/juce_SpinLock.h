@@ -53,8 +53,17 @@ namespace juce
 class JUCE_API  SpinLock
 {
 public:
+   #if defined (__WINE__)
+    /* librtpi-backed non-recursive PI mutex.  pi_mutex_init zeros the
+     * struct and stores flags=0; safe to call from a static ctor.  See
+     * comment on the `lock` member below for why we swap away from the
+     * upstream spin-yield loop under __WINE__. */
+    SpinLock()  noexcept { pi_mutex_init    (&lock, 0); }
+    ~SpinLock() noexcept { pi_mutex_destroy (&lock); }
+   #else
     inline SpinLock() = default;
     inline ~SpinLock() = default;
+   #endif
 
     /** Acquires the lock.
         This will block until the lock has been successfully acquired by this thread.
@@ -70,14 +79,25 @@ public:
     /** Attempts to acquire the lock, returning true if this was successful. */
     inline bool tryEnter() const noexcept
     {
+       #if defined (__WINE__)
+        return pi_mutex_trylock (&lock) == 0;
+       #else
         return lock.compareAndSetBool (1, 0);
+       #endif
     }
 
     /** Releases the lock. */
     inline void exit() const noexcept
     {
+       #if defined (__WINE__)
+        /* pi_mutex_unlock self-validates ownership (returns EPERM on
+         * TID mismatch).  No need for the upstream `lock.get() == 1`
+         * jassert — the kernel catches misuse at runtime. */
+        pi_mutex_unlock (&lock);
+       #else
         jassert (lock.get() == 1); // Agh! Releasing a lock that isn't currently held!
         lock = 0;
+       #endif
     }
 
     //==============================================================================
@@ -92,7 +112,28 @@ public:
 
 private:
     //==============================================================================
+   #if defined (__WINE__)
+    /* librtpi-backed non-recursive PI mutex.  Replaces the upstream
+     * Atomic<int> spin-yield path because, under SCHED_FIFO@80 on
+     * PREEMPT_RT, the upstream loop:
+     *
+     *     for (int i = 20; --i >= 0;) if (tryEnter()) return;
+     *     while (! tryEnter()) Thread::yield();
+     *
+     * starves the holder — Thread::yield() yields only to higher-prio
+     * threads, and a same-prio FIFO holder on the same CPU cannot make
+     * progress while the spinner consumes the CPU at the same priority.
+     *
+     * pi_mutex_lock instead deschedules the contender and stores the
+     * holder's TID in the futex word, letting the kernel boost the
+     * holder if needed (FUTEX_LOCK_PI) so it can release.  Uncontended
+     * cost is identical (one CAS); contended cost trades a ~500ns
+     * syscall round-trip for correctness (no more same-prio starvation
+     * deadlock).  See modules/juce_core/native/juce_winelib_rtpi.h. */
+    mutable pi_mutex_t lock;
+   #else
     mutable Atomic<int> lock;
+   #endif
 
     JUCE_DECLARE_NON_COPYABLE (SpinLock)
 };
