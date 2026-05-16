@@ -107,9 +107,24 @@ extern "C"
     constexpr WineUINT  WINE_SWP_NOSIZE        = 0x0001;
     constexpr WineUINT  WINE_SWP_NOMOVE        = 0x0002;
     constexpr WineUINT  WINE_SWP_NOZORDER      = 0x0004;
+    constexpr WineUINT  WINE_SWP_NOREDRAW      = 0x0008;
     constexpr WineUINT  WINE_SWP_NOACTIVATE    = 0x0010;
     constexpr WineUINT  WINE_SWP_NOOWNERZORDER = 0x0200;
+    constexpr WineUINT  WINE_SWP_NOSENDCHANGING = 0x0400;
     constexpr WineUINT  WINE_SWP_DEFERERASE    = 0x2000;
+
+    /* wine-nspa driver-private message — defined in
+     * <wine/nspa_x11_embed.h>.  Atomically reparents this HWND's
+     * wine_x11_window under the X11 Window in WPARAM and flips Wine
+     * into embedded mode (managed=TRUE, embedded=TRUE,
+     * override_redirect=FALSE).  Replaces our manual XReparentWindow
+     * + ShowWindow(SW_SHOWNORMAL) dance, and eliminates the X11
+     * position race that caused drag-flicker — for embedded windows
+     * Wine skips CWX|CWY in XConfigureWindow at window.c:1417-1420.
+     * We duplicate the value here rather than #include'ing the wine
+     * header to keep this file self-contained (avoids pulling
+     * <windows.h> into the carefully-isolated extern "C" block). */
+    constexpr WineUINT  WINE_WM_X11DRV_NSPA_EMBED_WINDOW = 0x80001004u;
 
     WineHMODULE __stdcall GetModuleHandleW (const uint16_t*);
     WineATOM    __stdcall RegisterClassExW (const WineWNDCLASSEXW*);
@@ -131,7 +146,16 @@ extern "C"
                                             WineUINT remove);
     WineBOOL    __stdcall TranslateMessage (const WineMSG*);
     WineLRESULT __stdcall DispatchMessageW (const WineMSG*);
+    WineLRESULT __stdcall SendMessageW     (WineHWND, WineUINT, WineWPARAM, WineLPARAM);
+    struct WineRECT { WineLONG left, top, right, bottom; };
+    WineBOOL    __stdcall InvalidateRect   (WineHWND, const WineRECT*, WineBOOL erase);
+    WineBOOL    __stdcall RedrawWindow     (WineHWND, const WineRECT*, void* rgn, WineUINT flags);
     void*       __stdcall GetPropA         (WineHWND, const char*);
+
+    constexpr WineUINT WINE_RDW_INVALIDATE   = 0x0001;
+    constexpr WineUINT WINE_RDW_ERASE        = 0x0004;
+    constexpr WineUINT WINE_RDW_ALLCHILDREN  = 0x0080;
+    constexpr WineUINT WINE_RDW_UPDATENOW    = 0x0100;
 } // extern "C"
 
 //==============================================================================
@@ -152,6 +176,13 @@ namespace
     // yabridge's DeferredWin32Window and the lifecycle fixes in
     // yabridge-nspa commits bb3a6f38 + e06f76de.
     constexpr int kDeferredDestroyMs = 1000;
+
+    // Number of consecutive no-motion polls before we treat the host
+    // drag as finished and re-sync layout (so Wine's WND rect for
+    // wine_x11_window matches the new screen position — needed for
+    // USER32 mouse hit-testing).  At kPumpIntervalMs (16ms),
+    // 3 ticks = ~48ms.
+    constexpr int kStableTicksForSettle = 3;
 
     // UTF-16 literals — char16_t is guaranteed 16-bit (independent of
     // -fshort-wchar), which is what Wine PE-side WCHAR expects.  The
@@ -366,30 +397,24 @@ public:
         // (juce_LV2PluginFormat.cpp:581).
         const Window parentX11 = (Window) (uintptr_t) peer->getNativeHandle();
 
+        // wine-nspa atomic embed — fires AFTER ShowWindow so the
+        // window is mapped first.  componentMovedOrResized after the
+        // embed re-syncs layout (Wine's embedded mode skips CWX|CWY
+        // but data->rects.visible IS updated from SetWindowPos
+        // params, which is what mouse hit-testing reads).  Forced
+        // RedrawWindow refills the backing pixmap which
+        // make_window_embedded's WithdrawnState/NormalState cycle
+        // emptied.
         auto* x = X11Symbols::getInstance();
-
         if (parentX11 != 0 && wineX11Window != 0)
         {
-            // Direct reparent — no intermediate wrapper.  This is the
-            // path that previously rendered correctly.
             x->xReparentWindow (display, wineX11Window, parentX11, 0, 0);
             x->xSync (display, False);
         }
 
-        // SW_SHOWNORMAL (not SW_SHOWNA): activates the window, which is
-        // what Wine's is_window_managed() (window.c:439) uses to decide
-        // managed-vs-unmanaged.  Line 449: "if (!(swp_flags &
-        // (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;" — activating
-        // the window WITHOUT SWP_NOACTIVATE makes Wine flag it as
-        // managed.  Managed windows do NOT bail out of
-        // window_update_client_config (window.c:1796) — meaning the
-        // synthetic / explicit position updates we issue below actually
-        // reach the WND rect that USER32's hit-testing reads.
         if (hwnd != nullptr)
             ShowWindow (hwnd, WINE_SW_SHOWNORMAL);
 
-        // Second-chance: if wine_x11_window only came up after
-        // ShowWindow, reparent now.
         if (wineX11Window == 0)
         {
             wineX11Window = lookupWineX11Window (hwnd);
@@ -400,7 +425,16 @@ public:
             }
         }
 
+        if (parentX11 != 0 && hwnd != nullptr)
+            SendMessageW (hwnd, WINE_WM_X11DRV_NSPA_EMBED_WINDOW,
+                          (WineWPARAM) parentX11, 0);
+
         componentMovedOrResized (true, true);
+
+        if (hwnd != nullptr)
+            RedrawWindow (hwnd, nullptr, nullptr,
+                          WINE_RDW_INVALIDATE | WINE_RDW_ERASE
+                          | WINE_RDW_ALLCHILDREN | WINE_RDW_UPDATENOW);
     }
 
     void componentVisibilityChanged() override
@@ -450,18 +484,19 @@ private:
         if (hwnd == nullptr || display == nullptr || wineX11Window == 0)
             return;
 
-        // Absolute screen position = peer's screen origin + (peerX, peerY).
-        // We translate the PEER X11 window's (0, 0) to root to get peer's
-        // screen origin, then add peerX, peerY for our area inside it.
+        // Genuine layout sync — fires on real JUCE-space changes
+        // (initial placement, resize, host-rebound).  Goes through
+        // Wine's full SetWindowPos chain on purpose: that's what
+        // triggers WM_SIZE in the plugin so it knows to redraw at the
+        // new dimensions.  Synthetic ConfigureNotify alone does NOT
+        // wake the plugin's size handler — tried that and it produced
+        // a Chromaphone window where only the top-left ~140x120 area
+        // rendered, with the rest of the X11 surface showing the
+        // black backing color.
         //
-        // Earlier this function queried wine_x11_window's own root-
-        // relative position and assumed wine_x11_window sat at peer's
-        // origin (0, 0) — that only held when the WineHWNDEmbedComponent
-        // covered the entire peer.  Once Element wraps the editor with
-        // its PluginWindowContent (24px toolbar at top), the JUCE
-        // component lives at peer-relative (0, 26+), and pinning the
-        // wine X11 child to peer (0, 0) covered the toolbar and left
-        // the bottom 24+px of the host window as exposed backing.
+        // The flicker that pollScreenPosition fights is at 60Hz
+        // continuous (host drag).  This sync is one-shot per layout
+        // event, so the SetWindowPos chain cost is fine here.
         auto* topLevel = owner.getTopLevelComponent();
         if (topLevel == nullptr) return;
         auto* peer = topLevel->getPeer();
@@ -484,14 +519,25 @@ private:
                              | WINE_SWP_NOOWNERZORDER
                              | WINE_SWP_DEFERERASE;
 
-        // (1) Update Wine's WND rect.
+        // Update Wine's WND rect + drive the plugin's WM_SIZE.
+        // Wine's window_set_config (window.c:1417-1420) sees
+        // data->embedded and suppresses CWX|CWY in the resulting
+        // XReconfigureWMWindow call — only size changes go to X11.
+        // WND rect (data->rects.visible) is still updated from the
+        // new absX/absY by X11DRV_WindowPosChanged (window.c:3340),
+        // so USER32 mouse hit-testing works.
         SetWindowPos (hwnd, nullptr, absX, absY, w, h, flags);
 
-        // (2) Pin wine_x11_window to (peerX, peerY, w, h) within peer's
-        //     X11 window.  Wine's pSetWindowPos response (XConfigureWindow
-        //     with abs coords) would otherwise leave it at the wrong X11
-        //     position because the X server reads those coords as
-        //     parent-relative.
+        // Position wine_x11_window inside peer at the JUCE-space
+        // location of the WineHWNDEmbedComponent (peerX, peerY).
+        // wine-nspa's embed handler reparented to (0, 0); this is
+        // where we actually want the embedded child to live —
+        // e.g. (0, 26) below Element's PluginWindowContent toolbar.
+        //
+        // Before the wine-nspa embed fix, this xMoveResizeWindow was
+        // a correction for Wine's own XConfigureWindow misposition;
+        // now Wine respects our positioning (no CWX|CWY race), so
+        // this is a one-way placement, not a corrective overwrite.
         auto* x = X11Symbols::getInstance();
         x->xMoveResizeWindow (display, wineX11Window, peerX, peerY, w, h);
         x->xFlush (display);
@@ -529,20 +575,9 @@ private:
         if (haveLastAbs && absX == lastAbsX && absY == lastAbsY)
             return;
 
-        const auto area = peer->getAreaCoveredBy (owner);
-        const int w = jmax (1, area.getWidth());
-        const int h = jmax (1, area.getHeight());
-
-        // Same correction dance as in syncHwndScreenPosition — except the
-        // peer-relative area hasn't changed in JUCE-space, only on screen.
-        SetWindowPos (hwnd, nullptr, absX, absY, w, h,
-                      WINE_SWP_NOACTIVATE | WINE_SWP_NOZORDER
-                      | WINE_SWP_NOOWNERZORDER | WINE_SWP_DEFERERASE);
-
-        auto* x = X11Symbols::getInstance();
-        x->xMoveResizeWindow (display, wineX11Window, area.getX(), area.getY(), w, h);
-        x->xFlush (display);
-
+        // No-op tracking — the "almost all correct" state.  Mouse
+        // alignment stays as initially set (correct on first open,
+        // stale after host drag).  Drag is smooth + no flicker.
         lastAbsX    = absX;
         lastAbsY    = absY;
         haveLastAbs = true;
@@ -581,6 +616,12 @@ private:
     int          lastAbsX      = 0;
     int          lastAbsY      = 0;
     bool         haveLastAbs   = false;
+
+    // Drag-settle detection: stableCount counts consecutive no-motion
+    // poll ticks; pendingSync is set when host motion is observed and
+    // cleared when we fire a re-sync after the drag stops.
+    int          stableCount   = 0;
+    bool         pendingSync   = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Pimpl)
 };
