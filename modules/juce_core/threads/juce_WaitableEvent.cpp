@@ -42,6 +42,50 @@ WaitableEvent::WaitableEvent (bool manualReset) noexcept
 
 bool WaitableEvent::wait (double timeOutMilliseconds) const
 {
+   #if defined (__WINE__)
+    /* librtpi-backed wait.  Same auto-reset / manual-reset contract as
+     * the upstream std::cv path: predicate loop handles spurious wakes
+     * and the broadcast()-wake-multiple race in auto-reset mode
+     * (multiple waiters wake, first to acquire the mutex sees
+     * triggered=true and clears it inside the held lock; subsequent
+     * waiters re-check and re-wait).
+     *
+     * Note the loop structure: triggered is re-checked at the TOP of
+     * each iteration, after any wake.  This collapses three cases —
+     * legitimate signal, spurious wake, and timeout-with-signal-race
+     * (signal arrives just as the kernel decides we've timed out) —
+     * into the same code path.  Without that, the timeout-with-signal
+     * race would drop the signal and return false. */
+    std::unique_lock<PiMutex> lock (mutex);
+
+    if (timeOutMilliseconds < 0.0)
+    {
+        while (! triggered.load())
+            condition.wait (mutex);
+    }
+    else
+    {
+        /* Absolute deadline captured once.  Each iteration recomputes
+         * remaining so spurious wakes can't reset the timeout (matches
+         * std::condition_variable::wait_for with a predicate, which is
+         * implemented in terms of wait_until under an absolute
+         * deadline). */
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::duration<double, std::milli> { timeOutMilliseconds };
+        while (! triggered.load())
+        {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            if (remaining <= std::chrono::steady_clock::duration::zero())
+                return false;
+            condition.timed_wait (mutex, remaining);
+        }
+    }
+
+    if (! useManualReset)
+        reset();
+
+    return true;
+   #else
     std::unique_lock<std::mutex> lock (mutex);
 
     if (! triggered)
@@ -64,14 +108,25 @@ bool WaitableEvent::wait (double timeOutMilliseconds) const
         reset();
 
     return true;
+   #endif
 }
 
 void WaitableEvent::signal() const
 {
+   #if defined (__WINE__)
+    /* broadcast() (vs signal()) mirrors upstream's notify_all so
+     * behaviour is identical for callers; auto-reset's one-waiter
+     * semantics fall out of the predicate loop in wait(). */
+    std::lock_guard<PiMutex> lock (mutex);
+
+    triggered.store (true);
+    condition.broadcast (mutex);
+   #else
     std::lock_guard<std::mutex> lock (mutex);
 
     triggered = true;
     condition.notify_all();
+   #endif
 }
 
 void WaitableEvent::reset() const

@@ -101,8 +101,21 @@ private:
     //==============================================================================
     bool useManualReset;
 
+   #if defined (__WINE__)
+    /* librtpi-backed mutex+cv pair.  PiMutex+PiCond use FUTEX_LOCK_PI
+     * + FUTEX_WAIT_REQUEUE_PI under the hood: signal() requeues the
+     * woken waiter directly onto the mutex's PI chain so there's no
+     * wake/lock gap that std::condition_variable's pthread_cond_t
+     * leaves open under PI semantics.  CLOCK_MONOTONIC for timed
+     * waits (default for FUTEX_WAIT_REQUEUE_PI when the cond is not
+     * inited with RTPI_COND_CLOCK_REALTIME).  See
+     * modules/juce_core/native/juce_winelib_rtpi.h. */
+    mutable PiMutex mutex;
+    mutable PiCond  condition;
+   #else
     mutable std::mutex mutex;
     mutable std::condition_variable condition;
+   #endif
     mutable std::atomic<bool> triggered { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WaitableEvent)
