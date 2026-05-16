@@ -414,18 +414,29 @@ public:
         // (juce_LV2PluginFormat.cpp:581).
         const Window parentX11 = (Window) (uintptr_t) peer->getNativeHandle();
 
-        // wine-nspa atomic embed — fires AFTER ShowWindow so the
-        // window is mapped first.  componentMovedOrResized after the
-        // embed re-syncs layout (Wine's embedded mode skips CWX|CWY
-        // but data->rects.visible IS updated from SetWindowPos
-        // params, which is what mouse hit-testing reads).  Forced
-        // RedrawWindow refills the backing pixmap which
-        // make_window_embedded's WithdrawnState/NormalState cycle
-        // emptied.
+        // wine-nspa atomic embed.  Pass the parent-relative position
+        // (peerX, peerY) of our WineHWNDEmbedComponent in the LPARAM
+        // so wine-nspa's handler reparents wine_x11_window at that
+        // position AND locks Wine's embedded-mode position state to
+        // match.  Otherwise the host changing peer-relative layout
+        // later (e.g. dropping a toolbar reservation) leaves a
+        // vertical offset between Wine's WND rect and where the X11
+        // window actually is, producing offset mouse input.
+        auto* topLevel = owner.getTopLevelComponent();
+        auto* peerNow  = topLevel != nullptr ? topLevel->getPeer() : nullptr;
+        const auto initialArea = peerNow != nullptr
+                                   ? peerNow->getAreaCoveredBy (owner)
+                                   : juce::Rectangle<int> {};
+        const int peerX = initialArea.getX();
+        const int peerY = initialArea.getY();
+        const WineLPARAM embedLp =
+            (WineLPARAM) ((((unsigned) peerY & 0xFFFF) << 16)
+                          | ((unsigned) peerX & 0xFFFF));
+
         auto* x = X11Symbols::getInstance();
         if (parentX11 != 0 && wineX11Window != 0)
         {
-            x->xReparentWindow (display, wineX11Window, parentX11, 0, 0);
+            x->xReparentWindow (display, wineX11Window, parentX11, peerX, peerY);
             x->xSync (display, False);
         }
 
@@ -437,14 +448,14 @@ public:
             wineX11Window = lookupWineX11Window (hwnd);
             if (wineX11Window != 0 && parentX11 != 0)
             {
-                x->xReparentWindow (display, wineX11Window, parentX11, 0, 0);
+                x->xReparentWindow (display, wineX11Window, parentX11, peerX, peerY);
                 x->xSync (display, False);
             }
         }
 
         if (parentX11 != 0 && hwnd != nullptr)
             SendMessageW (hwnd, WINE_WM_X11DRV_NSPA_EMBED_WINDOW,
-                          (WineWPARAM) parentX11, 0);
+                          (WineWPARAM) parentX11, embedLp);
 
         componentMovedOrResized (true, true);
 
@@ -592,9 +603,7 @@ private:
         if (haveLastAbs && absX == lastAbsX && absY == lastAbsY)
             return;
 
-        // No-op tracking — the "almost all correct" state.  Mouse
-        // alignment stays as initially set (correct on first open,
-        // stale after host drag).  Drag is smooth + no flicker.
+        // No-op — just track position.  No SetWindowPos here.
         lastAbsX    = absX;
         lastAbsY    = absY;
         haveLastAbs = true;
