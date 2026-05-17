@@ -91,6 +91,17 @@ extern "C" {
 
 constexpr WineDWORD WINELIB_INFINITE             = 0xFFFFFFFFu;
 constexpr int       WINELIB_THREAD_TIME_CRITICAL = 15;  // THREAD_PRIORITY_TIME_CRITICAL
+/* THREAD_PRIORITY_IDLE inside REALTIME_PRIORITY_CLASS is the LOWEST
+ * band of the realtime priority class — Win32 still RT, still
+ * SCHED_FIFO under NSPA (NT 16 → FIFO 65 with NSPA_RT_PRIO=80), but
+ * well below the audio callback band (NT 31 → FIFO 80).  The
+ * dispatcher needs both halves of the RT condition (Win32 RT class +
+ * Linux SCHED_FIFO) so plugin worker pools spawned from it inherit a
+ * real-time policy, but it does NOT need to sit at audio-equivalent
+ * priority — that's what causes desktop freezes during heavy plugin
+ * init.  Used in place of WINELIB_THREAD_TIME_CRITICAL on the
+ * dispatcher self-promotion path. */
+constexpr int       WINELIB_THREAD_IDLE          = -15; // THREAD_PRIORITY_IDLE
 
 class WineWin32Dispatcher
 {
@@ -162,18 +173,24 @@ private:
         // on the worker thread instead of the host main.
         OleInitialize (nullptr);
 
-        // Promote to NSPA's RT band.  SetThreadPriority(TIME_CRITICAL)
-        // routes through ntdll's NtSetInformationThread handler under
-        // NSPA, which maps to SCHED_FIFO at NSPA_RT_PRIO.  Mirror of
-        // yabridge::nspa::set_thread_time_critical (nspa_rt.h:71).
-        // Plugin worker pools spawned during PROCESS_ATTACH / DllMain /
-        // pluginCreate inherit the creator's scheduling — without this
-        // promotion u-he's boost::thread workers throw
-        // boost::thread_resource_error when the kernel refuses
-        // pthread_create's RT request from a non-RT parent.  Process
-        // priority class is already REALTIME via Element's
-        // WinelibPluginHostInit (src/main.cc).
-        SetThreadPriority (GetCurrentThread(), WINELIB_THREAD_TIME_CRITICAL);
+        // Self-promote to the LOWEST band of REALTIME_PRIORITY_CLASS.
+        // The host process priority class is expected to already be
+        // REALTIME (host responsibility, set via SetPriorityClass before
+        // this dispatcher starts), so combining it with
+        // THREAD_PRIORITY_IDLE puts this dispatcher at NT band 16 →
+        // SCHED_FIFO at the lower end of NSPA's RT band.  Both halves
+        // of the RT condition hold (Win32 RT class + Linux SCHED_FIFO),
+        // so pthread_create from this thread still satisfies the
+        // kernel's RT inheritance check — plugin worker pools spawned
+        // during PROCESS_ATTACH / DllMain / pluginCreate inherit the
+        // RT policy.  But the dispatcher itself stays well below the
+        // audio band (NT 31), so heavy plugin init (sample loading,
+        // GUI construction) doesn't compete with TIME_CRITICAL audio
+        // callbacks and doesn't starve the desktop.  Plugin audio
+        // workers that explicitly call SetThreadPriority(TIME_CRITICAL)
+        // still get promoted to NSPA_RT_PRIO themselves — they don't
+        // rely on inheriting it from this dispatcher.
+        SetThreadPriority (GetCurrentThread(), WINELIB_THREAD_IDLE);
 
         auto* self = static_cast<WineWin32Dispatcher*> (selfPtr);
         self->workerThreadId = std::this_thread::get_id();
