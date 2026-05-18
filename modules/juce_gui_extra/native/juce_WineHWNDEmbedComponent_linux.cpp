@@ -637,15 +637,46 @@ private:
     // of guaranteed X11-poll headroom per cycle.
     static constexpr int kPumpDrainBudgetMs = 4;
 
+    // Win32 message-range constants for the input-first drain pass.
+    // Mouse: WM_MOUSEFIRST .. WM_MOUSELAST (0x0200 .. 0x020E).
+    // Keyboard: WM_KEYFIRST .. WM_KEYLAST  (0x0100 .. 0x0109).
+    static constexpr WineUINT WINE_WM_MOUSEFIRST = 0x0200;
+    static constexpr WineUINT WINE_WM_MOUSELAST  = 0x020E;
+    static constexpr WineUINT WINE_WM_KEYFIRST   = 0x0100;
+    static constexpr WineUINT WINE_WM_KEYLAST    = 0x0109;
+
     void timerCallback() override
     {
         if (hwnd == nullptr)
             return;
 
+        WineMSG msg;
+
+        // Input-first drain.  Peek the mouse and keyboard ranges
+        // without a time cap before the general drain.  Win32 message
+        // priority puts these ahead of WM_PAINT / WM_TIMER, but
+        // PeekMessage only consults priority against messages already
+        // in the queue — when a plugin's handler invalidates regions
+        // every tick the general drain spends its whole budget on
+        // WM_PAINT / WM_TIMER and input ends up at the tail of a long
+        // queue.  Two range-filtered peek loops ensure input dispatches
+        // promptly even under that backlog.  Input volume is small in
+        // practice (mouse rate ~100 Hz at most), so this can't itself
+        // starve the X11 poll.
+        while (PeekMessageW (&msg, nullptr, WINE_WM_MOUSEFIRST, WINE_WM_MOUSELAST, WINE_PM_REMOVE))
+        {
+            TranslateMessage (&msg);
+            DispatchMessageW (&msg);
+        }
+        while (PeekMessageW (&msg, nullptr, WINE_WM_KEYFIRST, WINE_WM_KEYLAST, WINE_PM_REMOVE))
+        {
+            TranslateMessage (&msg);
+            DispatchMessageW (&msg);
+        }
+
         const auto deadline = juce::Time::getMillisecondCounterHiRes()
                             + (double) kPumpDrainBudgetMs;
 
-        WineMSG msg;
         while (PeekMessageW (&msg, nullptr, 0, 0, WINE_PM_REMOVE))
         {
             TranslateMessage (&msg);
