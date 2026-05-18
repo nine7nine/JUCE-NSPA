@@ -619,16 +619,39 @@ private:
     // critical because the plugin's GUI window is a CHILD HWND of ours
     // and filtering to our HWND alone would skip the plugin's WM_PAINT
     // / mouse / keyboard messages.
+    //
+    // The drain is time-capped at kPumpDrainBudgetMs.  An unbounded
+    // `while (PeekMessage)` loop starves the JUCE message thread of
+    // X11 event polling whenever a plugin's WM_TIMER handler queues
+    // messages (e.g. WM_PAINT via InvalidateRect, or the next
+    // WM_TIMER coalescing in faster than the handler returns) at a
+    // rate equal to or higher than the drain rate.  Observed shape:
+    // timerCallback never returns, X11 button / motion events queued
+    // at the WM never reach the message queue, the UI appears frozen
+    // even though the plugin is happily redrawing.
+    //
+    // Time-cap keeps the steady-state pump behaviour (fast handlers
+    // drain many messages per tick) while bounding the worst case so
+    // the message thread always returns to its X11 poll within a few
+    // milliseconds.  16 ms timer period - 4 ms drain budget = 12 ms
+    // of guaranteed X11-poll headroom per cycle.
+    static constexpr int kPumpDrainBudgetMs = 4;
+
     void timerCallback() override
     {
         if (hwnd == nullptr)
             return;
+
+        const auto deadline = juce::Time::getMillisecondCounterHiRes()
+                            + (double) kPumpDrainBudgetMs;
 
         WineMSG msg;
         while (PeekMessageW (&msg, nullptr, 0, 0, WINE_PM_REMOVE))
         {
             TranslateMessage (&msg);
             DispatchMessageW (&msg);
+            if (juce::Time::getMillisecondCounterHiRes() >= deadline)
+                break;
         }
 
         pollScreenPosition();
