@@ -1310,22 +1310,22 @@ protected:
 
     //==============================================================================
     // Host thread-check extension — plugin queries which thread it's on.
-    // We track the main thread id at instance construction; the audio
-    // thread is whichever thread calls processBlock.
+    // CLAP spec defines the main thread as the host's UI thread; for JUCE
+    // that's MessageManager's message thread.  Audio thread is whichever
+    // thread calls processBlock, captured lazily on first entry.
 
-    static bool CLAP_ABI host_is_main_thread (const clap_host_t* host)
+    static bool CLAP_ABI host_is_main_thread (const clap_host_t* /*host*/)
     {
         // True iff this thread is currently dispatching a main-thread
-        // call on the plugin's behalf (clap_current_role==Main) OR is
-        // the actual JUCE message thread (host_data captures it).  The
-        // former covers our Win32-dispatcher-worker marshaling case;
-        // the latter handles direct main-thread invocation (eg. if a
-        // host extension callback fires from the message thread).
+        // call on the plugin's behalf (clap_current_role==Main) OR is the
+        // actual JUCE message thread.  The former covers our Win32-
+        // dispatcher-worker marshaling case; the latter handles direct
+        // main-thread invocation (eg. an editor-side GUI handshake or a
+        // host extension callback firing from the message thread).
         if (clap_current_role == ClapDispatchRole::Main)
             return true;
-        if (auto* self = static_cast<CLAPPluginInstance*> (host->host_data))
-            return std::this_thread::get_id() == self->mainThreadId;
-        return false;
+        auto* mm = MessageManager::getInstanceWithoutCreating();
+        return mm != nullptr && mm->isThisTheMessageThread();
     }
 
     static bool CLAP_ABI host_is_audio_thread (const clap_host_t* host)
@@ -1398,11 +1398,11 @@ protected:
 
     WineWin32Dispatcher instanceDispatcher;
 
-    // Thread identity tracking for clap_host_thread_check.  Main thread
-    // captured at construction (likely JUCE message thread).  Audio thread
-    // captured on first processBlock entry — typically the host's RT
-    // audio pthread.
-    std::thread::id              mainThreadId  = std::this_thread::get_id();
+    // Audio-thread identity tracked lazily on first processBlock entry —
+    // typically the host's RT audio pthread.  Main-thread identity is
+    // resolved at call time via MessageManager (see host_is_main_thread)
+    // so a non-main-thread construction site (eg. async plugin load on a
+    // worker thread) doesn't poison the answer.
     std::atomic<std::thread::id> audioThreadId { std::thread::id() };
 
     std::atomic<bool> activated  { false };

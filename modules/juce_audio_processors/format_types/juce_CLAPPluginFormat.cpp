@@ -125,10 +125,13 @@ CLAPPluginEditor::CLAPPluginEditor (CLAPPluginInstanceWithEditor& inst,
     // view->attached() on the message thread (juce_VST3PluginFormat.cpp's
     // VST3PluginWindow::attachPluginWindow — no dispatcher wrap there).
     //
-    // Thread-check answers stay consistent: the editor's ctor runs on the
-    // JUCE message thread, which equals CLAPPluginInstance::mainThreadId
-    // (captured at construction), so host_is_main_thread() returns true
-    // without needing ScopedClapDispatchRole markers.
+    // Thread-check identity is asserted via a ScopedClapDispatchRole::Main
+    // marker covering the handshake.  The thread_local role flag is what
+    // host_is_main_thread answers on; no dispatcher hop, so the deadlock
+    // rationale above still holds.  This makes the answer robust even if
+    // the message thread differs from whichever thread happened to
+    // construct CLAPPluginInstance (eg. async plugin load on a worker).
+    ScopedClapDispatchRole role (ClapDispatchRole::Main);
 
     auto* plug = instance.getPlugin();
 
@@ -185,11 +188,14 @@ CLAPPluginEditor::~CLAPPluginEditor()
     auto* plug = instance.getPlugin();
     if (plug == nullptr) return;
 
-    // Direct on JUCE message thread — same rationale as the ctor.
-    // WineHWNDEmbedComponent's destructor handles the deferred X11
-    // unmap + reparent-to-root + delayed DestroyWindow that the VST3
-    // path uses to keep wine_x11_window-targeted X11 events from
-    // racing the teardown.
+    // Direct on JUCE message thread — same rationale as the ctor.  Role
+    // marker mirrors the ctor's so host_is_main_thread answers true via
+    // the thread_local fast path.  WineHWNDEmbedComponent's destructor
+    // handles the deferred X11 unmap + reparent-to-root + delayed
+    // DestroyWindow that the VST3 path uses to keep wine_x11_window-
+    // targeted X11 events from racing the teardown.
+    ScopedClapDispatchRole role (ClapDispatchRole::Main);
+
     gui->hide (plug);
     gui->destroy (plug);
 }
@@ -207,13 +213,17 @@ void CLAPPluginEditor::resized()
     const uint32_t w = (uint32_t) jmax (1, getWidth());
     const uint32_t h = (uint32_t) jmax (1, getHeight());
 
+    ScopedClapDispatchRole role (ClapDispatchRole::Main);
     gui->set_size (plug, w, h);
 }
 
 void CLAPPluginEditor::timerCallback()
 {
     // Plugin-requested resize?  host_request_resize stashed dimensions
-    // in atomic fields on the instance.
+    // in atomic fields on the instance.  setSize re-enters
+    // CLAPPluginEditor::resized which carries its own role marker.
+    ScopedClapDispatchRole role (ClapDispatchRole::Main);
+
     if (instance.pendingEditorResize.exchange (false, std::memory_order_acq_rel))
     {
         const auto w = (int) instance.pendingEditorResizeW.load (std::memory_order_acquire);
