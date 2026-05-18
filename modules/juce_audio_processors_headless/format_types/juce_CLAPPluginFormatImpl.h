@@ -446,15 +446,23 @@ struct ClapEventBridge
 
     void clear() noexcept { count = 0; }
 
-    // Translate a JUCE MidiMessage into one CLAP event entry.  Drops the
-    // event if we're at capacity (RT-safe: no allocation).
-    void append (const MidiMessage& m, int sampleOffset) noexcept
+    // Translate a JUCE MidiMessage into one CLAP event entry.  Dialect
+    // choice driven by `preferCLAPNotes`:
+    //   true  → note on/off encoded as clap_event_note (CLAP_EVENT_NOTE_*);
+    //           everything else as clap_event_midi.
+    //   false → all events encoded as clap_event_midi (CLAP_NOTE_DIALECT_MIDI
+    //           plugins prefer this and may not accept CLAP_EVENT_NOTE_*).
+    // Spec (events.h:43-44) forbids double-encoding the same event with
+    // both clap_event_note and clap_event_midi — the dialect gate keeps
+    // us off that footgun.
+    // Drops the event if we're at capacity (RT-safe: no allocation).
+    void append (const MidiMessage& m, int sampleOffset, bool preferCLAPNotes) noexcept
     {
         if (count >= kMaxEventsPerBlock) return;
 
         auto* slot = storage.getData() + count * kSlotBytes;
 
-        if (m.isNoteOn() || m.isNoteOff())
+        if (preferCLAPNotes && (m.isNoteOn() || m.isNoteOff()))
         {
             auto* ev = reinterpret_cast<clap_event_note_t*> (slot);
             ev->header.size     = (uint32_t) sizeof (clap_event_note_t);
@@ -471,9 +479,10 @@ struct ClapEventBridge
             return;
         }
 
-        // Everything else: raw MIDI passthrough (CC, pitch bend, aftertouch,
-        // program change, etc).  Plugin's clap.note-ports must include a
-        // CLAP_NOTE_DIALECT_MIDI port to consume these — most synths do.
+        // Everything else (or all events under MIDI dialect): raw MIDI
+        // passthrough.  Carries CC, pitch bend, aftertouch, program
+        // change, channel-pressure — and, under MIDI dialect, also
+        // note on/off (status byte makes that obvious to the plugin).
         if (m.getRawDataSize() >= 1 && m.getRawDataSize() <= 3)
         {
             auto* ev = reinterpret_cast<clap_event_midi_t*> (slot);
@@ -490,7 +499,7 @@ struct ClapEventBridge
             ptrs[count++] = &ev->header;
         }
         // SysEx / longer messages: dropped for now (clap_event_midi_sysex
-        // needs separate buffer management — Phase F if needed).
+        // needs separate buffer management — follow-up if required).
     }
 };
 
@@ -509,11 +518,66 @@ static const clap_event_header_t* CLAP_ABI inputEventsGet (const clap_input_even
     return b->ptrs[index];
 }
 
-// Output events: accept but discard for now.  Phase F will route MIDI/param
-// output back to JUCE's MidiBuffer + parameter listeners.
-static bool CLAP_ABI outputEventsTryPush (const clap_output_events_t*, const clap_event_header_t*)
+
+//==============================================================================
+// Plugin → host MIDI / event return path.  The plugin calls try_push() from
+// inside its process() (or main thread for non-realtime events) — we
+// translate CLAP events back into JUCE MidiMessages and drain into the
+// host's MidiBuffer after process() returns.  RT-safe: writes into a
+// pre-sized juce::MidiBuffer the audio thread already owns.
+
+struct ClapOutputBridge
 {
-    return true;
+    juce::MidiBuffer pending;
+
+    void reserve (int bytes) { pending.ensureSize ((size_t) bytes); }
+    void clear() noexcept    { pending.clear(); }
+
+    bool push (const clap_event_header_t* h) noexcept
+    {
+        if (h == nullptr || h->space_id != CLAP_CORE_EVENT_SPACE_ID)
+            return true; // accept-and-ignore non-core events
+
+        const int time = (int) h->time;
+
+        switch (h->type)
+        {
+            case CLAP_EVENT_NOTE_ON:
+            case CLAP_EVENT_NOTE_OFF:
+            {
+                const auto* n = reinterpret_cast<const clap_event_note_t*> (h);
+                const int chan = jlimit (1, 16, n->channel + 1); // CLAP 0..15 → JUCE 1..16
+                const int key  = jlimit (0, 127, (int) n->key);
+                const float vel = (float) jlimit (0.0, 1.0, n->velocity);
+
+                pending.addEvent (h->type == CLAP_EVENT_NOTE_ON
+                                  ? MidiMessage::noteOn  (chan, key, vel)
+                                  : MidiMessage::noteOff (chan, key, vel),
+                                  time);
+                return true;
+            }
+
+            case CLAP_EVENT_MIDI:
+            {
+                const auto* m = reinterpret_cast<const clap_event_midi_t*> (h);
+                pending.addEvent (m->data, 3, time);
+                return true;
+            }
+
+            // Param events, note expressions, MIDI2, sysex etc. — accept
+            // but don't translate; they don't fit JUCE's MidiBuffer model.
+            // Param routing belongs to a future params-extension commit.
+            default:
+                return true;
+        }
+    }
+};
+
+static bool CLAP_ABI outputEventsTryPush (const clap_output_events_t* list,
+                                          const clap_event_header_t*  event)
+{
+    auto* bridge = static_cast<ClapOutputBridge*> (list->ctx);
+    return bridge != nullptr ? bridge->push (event) : true;
 }
 
 
@@ -743,19 +807,37 @@ public:
         outAudioBuffer.latency       = 0;
         outAudioBuffer.constant_mask = 0;
 
-        // Convert this block's JUCE MIDI → CLAP events.  RT-safe:
-        // ClapEventBridge storage is pre-allocated in activate().
+        // Convert this block's JUCE MIDI → CLAP events.  Choose dialect
+        // per the plugin's preferred note port encoding queried at
+        // activate (preferCLAPDialect):
+        //   - CLAP dialect: emit clap_event_note for note on/off,
+        //                   clap_event_midi for everything else (CC,
+        //                   pitch bend, aftertouch, PC).
+        //   - MIDI / MIDI_MPE dialect: emit clap_event_midi for EVERYTHING
+        //                   (including note on/off), no clap_event_note.
+        // Spec (events.h:44-45) forbids encoding the same note via both
+        // CLAP_EVENT_NOTE_ON and CLAP_EVENT_MIDI; this dialect gate keeps
+        // us on the right side of that rule.  RT-safe: storage
+        // pre-allocated in activate().
         inputEventBridge.clear();
         for (const auto& meta : midiMessages)
-            inputEventBridge.append (meta.getMessage(), meta.samplePosition);
+            inputEventBridge.append (meta.getMessage(), meta.samplePosition,
+                                     /*preferCLAPNotes=*/ preferCLAPDialect);
 
-        clap_input_events_t  inEvents  { &inputEventBridge,  &inputEventsSize,  &inputEventsGet };
-        clap_output_events_t outEvents { nullptr,            &outputEventsTryPush };
+        clap_input_events_t  inEvents  { &inputEventBridge,
+                                         &inputEventsSize,  &inputEventsGet };
+
+        outputEventBridge.clear();
+        clap_output_events_t outEvents { &outputEventBridge, &outputEventsTryPush };
+
+        // Populate transport from JUCE's AudioPlayHead.  Plugins that
+        // tempo-sync (delays, LFOs, sequencers) read this each block.
+        const auto haveTransport = fillTransportFromPlayHead (transportInfo);
 
         clap_process_t proc {};
         proc.steady_time         = steadyTime;
         proc.frames_count        = frames;
-        proc.transport           = nullptr;
+        proc.transport           = haveTransport ? &transportInfo : nullptr;
         proc.audio_inputs        = (mainInputChannels  > 0) ? &inAudioBuffer  : nullptr;
         proc.audio_outputs       = (mainOutputChannels > 0) ? &outAudioBuffer : nullptr;
         proc.audio_inputs_count  = (mainInputChannels  > 0) ? 1u : 0u;
@@ -763,9 +845,8 @@ public:
         proc.in_events           = &inEvents;
         proc.out_events          = &outEvents;
 
-        // Clear JUCE's MIDI buffer — Phase D doesn't route plugin output
-        // MIDI back yet, but we shouldn't leave incoming events in the
-        // buffer for downstream nodes either.
+        // We're about to overwrite the host MidiBuffer with plugin output —
+        // clear the consumed input events so we don't pass them downstream.
         midiMessages.clear();
 
         clap_process_status status = CLAP_PROCESS_ERROR;
@@ -783,6 +864,11 @@ public:
         for (int c = (int) mainOutputChannels; c < buffer.getNumChannels(); ++c)
             buffer.clear (c, 0, (int) frames);
 
+        // Drain plugin's output events into the host's MidiBuffer.
+        // Translation handled by ClapOutputBridge::push (note on/off + raw
+        // MIDI; param + note-expression events are accepted-but-skipped).
+        midiMessages.swapWith (outputEventBridge.pending);
+
         steadyTime += (int64_t) frames;
     }
 
@@ -798,8 +884,8 @@ public:
     void getStateInformation (juce::MemoryBlock&) override {} // Phase G
     void setStateInformation (const void*, int)   override {} // Phase G
 
-    bool   acceptsMidi()         const override { return true; }
-    bool   producesMidi()        const override { return false; }
+    bool   acceptsMidi()         const override { return hasNoteInput; }
+    bool   producesMidi()        const override { return hasNoteOutput; }
     double getTailLengthSeconds() const override { return 0.0; }
 
     void refreshParameterList() override {} // Phase E
@@ -877,10 +963,12 @@ protected:
         }
 
         // Query audio-ports just enough to size processBlock buffers.
-        // Full bus exposure to JUCE lands in Phase F; for Phase D we only
-        // care about the main port channel count so we don't violate the
-        // process() contract.
         queryAudioPortShape();
+
+        // Query note-ports to set acceptsMidi / producesMidi accurately and
+        // pick the input dialect (CLAP_EVENT_NOTE_* vs CLAP_EVENT_MIDI).
+        queryNotePortShape();
+
         winelib_log ("[CLAPInstance] createAndInitialise done");
 
         return true;
@@ -999,6 +1087,147 @@ protected:
         // Pre-allocate the MIDI event bridge storage so processBlock
         // never allocates on the audio thread.
         inputEventBridge.ensureCapacity();
+        // 4 KB seed for plugin-output MIDI; JUCE's MidiBuffer grows on
+        // demand if a plugin emits an exceptionally dense block.
+        outputEventBridge.reserve (4096);
+    }
+
+    //==============================================================================
+    void queryNotePortShape()
+    {
+        const clap_plugin_note_ports_t* ports = nullptr;
+
+        instanceDispatcher.run ([&]
+        {
+            ScopedClapDispatchRole role (ClapDispatchRole::Main);
+            if (plugin->get_extension != nullptr)
+                ports = static_cast<const clap_plugin_note_ports_t*> (
+                            plugin->get_extension (plugin, CLAP_EXT_NOTE_PORTS));
+        });
+
+        if (ports == nullptr)
+        {
+            // No note-ports extension: assume MIDI in for instruments (so
+            // synths still play), no MIDI out, default to CLAP dialect for
+            // forward-compat with well-behaved plugins.
+            hasNoteInput   = cachedDescription.isInstrument;
+            hasNoteOutput  = false;
+            preferCLAPDialect = true;
+            return;
+        }
+
+        uint32_t inCount = 0, outCount = 0;
+        instanceDispatcher.run ([&]
+        {
+            ScopedClapDispatchRole role (ClapDispatchRole::Main);
+            inCount  = ports->count (plugin, true);
+            outCount = ports->count (plugin, false);
+        });
+
+        hasNoteInput  = inCount  > 0;
+        hasNoteOutput = outCount > 0;
+
+        // Pick dialect from the FIRST input port's preferred_dialect.
+        // Most plugins have a single note input; multi-port mixed-dialect
+        // is rare enough to defer.
+        preferCLAPDialect = true;
+        if (inCount > 0)
+        {
+            clap_note_port_info_t info {};
+            bool got = false;
+            instanceDispatcher.run ([&]
+            {
+                ScopedClapDispatchRole role (ClapDispatchRole::Main);
+                got = ports->get (plugin, 0, true, &info);
+            });
+
+            if (got)
+            {
+                // CLAP dialect wins if the plugin says it's preferred or
+                // it's the only supported one.  MIDI / MIDI_MPE / MIDI2
+                // plugins read raw clap_event_midi and may reject
+                // CLAP_EVENT_NOTE_* — fall back to raw MIDI for those.
+                preferCLAPDialect = (info.preferred_dialect == CLAP_NOTE_DIALECT_CLAP)
+                                 || ((info.supported_dialects & CLAP_NOTE_DIALECT_CLAP) != 0
+                                     && info.preferred_dialect == 0);
+
+                winelib_log ("[CLAP] '%s' note-port[0]: supported=0x%x preferred=0x%x → preferCLAPDialect=%d",
+                             cachedDescription.name.toRawUTF8(),
+                             info.supported_dialects, info.preferred_dialect,
+                             (int) preferCLAPDialect);
+            }
+        }
+
+        winelib_log ("[CLAP] '%s' note-ports: %u in / %u out",
+                     cachedDescription.name.toRawUTF8(), inCount, outCount);
+    }
+
+    //==============================================================================
+    // Build clap_event_transport from JUCE's AudioPlayHead.  Returns
+    // false if there's no playhead attached (the plugin then sees
+    // proc.transport=nullptr, meaning "free-running, no transport").
+    //
+    // Called once per processBlock — RT-safe (Optional<PositionInfo>
+    // returns a stack-allocated value; nothing here allocates).
+    bool fillTransportFromPlayHead (clap_event_transport_t& t) noexcept
+    {
+        auto* ph = getPlayHead();
+        if (ph == nullptr) return false;
+
+        const auto pos = ph->getPosition();
+        if (! pos.hasValue()) return false;
+
+        std::memset (&t, 0, sizeof (t));
+        t.header.size     = (uint32_t) sizeof (clap_event_transport_t);
+        t.header.time     = 0;
+        t.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        t.header.type     = (uint16_t) CLAP_EVENT_TRANSPORT;
+        t.header.flags    = 0;
+
+        uint32_t flags = 0;
+
+        if (auto bpm = pos->getBpm(); bpm.hasValue())
+        {
+            t.tempo = *bpm;
+            t.tempo_inc = 0.0;
+            flags |= CLAP_TRANSPORT_HAS_TEMPO;
+        }
+
+        if (auto ts = pos->getTimeSignature(); ts.hasValue())
+        {
+            t.tsig_num   = (uint16_t) jmax (1, ts->numerator);
+            t.tsig_denom = (uint16_t) jmax (1, ts->denominator);
+            flags |= CLAP_TRANSPORT_HAS_TIME_SIGNATURE;
+        }
+
+        if (auto ppq = pos->getPpqPosition(); ppq.hasValue())
+        {
+            t.song_pos_beats = (clap_beattime) llround (*ppq * (double) CLAP_BEATTIME_FACTOR);
+            flags |= CLAP_TRANSPORT_HAS_BEATS_TIMELINE;
+        }
+
+        if (auto secs = pos->getTimeInSeconds(); secs.hasValue())
+        {
+            t.song_pos_seconds = (clap_sectime) llround (*secs * (double) CLAP_SECTIME_FACTOR);
+            flags |= CLAP_TRANSPORT_HAS_SECONDS_TIMELINE;
+        }
+
+        if (auto barStart = pos->getPpqPositionOfLastBarStart(); barStart.hasValue())
+            t.bar_start = (clap_beattime) llround (*barStart * (double) CLAP_BEATTIME_FACTOR);
+
+        if (auto loop = pos->getLoopPoints(); loop.hasValue())
+        {
+            t.loop_start_beats = (clap_beattime) llround (loop->ppqStart * (double) CLAP_BEATTIME_FACTOR);
+            t.loop_end_beats   = (clap_beattime) llround (loop->ppqEnd   * (double) CLAP_BEATTIME_FACTOR);
+            if (pos->getIsLooping())
+                flags |= CLAP_TRANSPORT_IS_LOOP_ACTIVE;
+        }
+
+        if (pos->getIsPlaying())   flags |= CLAP_TRANSPORT_IS_PLAYING;
+        if (pos->getIsRecording()) flags |= CLAP_TRANSPORT_IS_RECORDING;
+
+        t.flags = flags;
+        return true;
     }
 
     //==============================================================================
@@ -1197,7 +1426,15 @@ protected:
     clap_audio_buffer_t inAudioBuffer  {};
     clap_audio_buffer_t outAudioBuffer {};
 
-    ClapEventBridge inputEventBridge;
+    ClapEventBridge        inputEventBridge;
+    ClapOutputBridge       outputEventBridge;
+    clap_event_transport_t transportInfo {};
+
+    // Set by queryNotePortShape at activate.  Drive acceptsMidi /
+    // producesMidi and the input event dialect.
+    bool hasNoteInput     = false;
+    bool hasNoteOutput    = false;
+    bool preferCLAPDialect = true;
 
     //==============================================================================
     // Plugin-requested editor resize / external close — drained on the
