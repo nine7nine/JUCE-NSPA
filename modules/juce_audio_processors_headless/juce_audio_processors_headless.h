@@ -110,6 +110,15 @@
  #define JUCE_PLUGINHOST_LV2 0
 #endif
 
+/** Config: JUCE_PLUGINHOST_CLAP
+    Enables the CLAP plugin hosting classes (winelib-only on this fork —
+    loads Windows .clap PE DLLs via Wine's LoadLibraryW; no Linux .so
+    CLAP loader path).
+ */
+#ifndef JUCE_PLUGINHOST_CLAP
+ #define JUCE_PLUGINHOST_CLAP 0
+#endif
+
 /** Config: JUCE_PLUGINHOST_ARA
     Enables the ARA plugin extension hosting classes. You will need to download the ARA SDK and specify the
     path to it either in the Projucer, using juce_set_ara_sdk_path() in your CMake project file.
@@ -160,5 +169,6 @@
 #include <juce_audio_processors_headless/format_types/juce_LV2PluginFormatHeadless.h>
 #include <juce_audio_processors_headless/format_types/juce_VST3PluginFormatHeadless.h>
 #include <juce_audio_processors_headless/format_types/juce_VSTPluginFormatHeadless.h>
+#include <juce_audio_processors_headless/format_types/juce_CLAPPluginFormatHeadless.h>
 #include <juce_audio_processors_headless/format_types/juce_ARAHosting.h>
 #include <juce_audio_processors_headless/format/juce_AudioPluginFormatManager.h>

@@ -42,7 +42,8 @@
  || defined (JUCE_INTERNAL_HAS_VST3) \
  || defined (JUCE_INTERNAL_HAS_AU) \
  || defined (JUCE_INTERNAL_HAS_LADSPA) \
- || defined (JUCE_INTERNAL_HAS_LV2)
+ || defined (JUCE_INTERNAL_HAS_LV2) \
+ || defined (JUCE_INTERNAL_HAS_CLAP)
  #error These preprocessor definitions should not be set by the build system. Use the JUCE_PLUGINHOST_* definitions instead.
 #endif
 
@@ -74,6 +75,16 @@
  #define JUCE_INTERNAL_HAS_LV2 1
 #else
  #define JUCE_INTERNAL_HAS_LV2 0
+#endif
+
+// CLAP hosting on this fork is winelib-only: we load Windows .clap PE DLLs
+// via Wine's LoadLibraryW.  There is no Linux .so CLAP loader path here.
+// The __WINE__ guard keeps the format invisible to any non-winelib build
+// that happens to enable JUCE_PLUGINHOST_CLAP.  See clap/juce_clap_winelib_abi.h.
+#if JUCE_PLUGINHOST_CLAP && defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
+ #define JUCE_INTERNAL_HAS_CLAP 1
+#else
+ #define JUCE_INTERNAL_HAS_CLAP 0
 #endif
 
 #if JUCE_PLUGINHOST_ARA && (JUCE_INTERNAL_HAS_VST3 || JUCE_INTERNAL_HAS_AU) && (JUCE_MAC || JUCE_WINDOWS || JUCE_LINUX)

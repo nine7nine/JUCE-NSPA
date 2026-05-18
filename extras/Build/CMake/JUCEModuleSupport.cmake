@@ -560,10 +560,18 @@ function(juce_add_module module_path)
 
         target_link_libraries(juce_audio_processors_headless INTERFACE juce_ara_headers)
 
+        # Vendored CLAP headers (free-audio/clap 1.2.0, MIT) for winelib-only
+        # Win32 CLAP hosting on this fork.  Mirrors the juce_vst3_headers pattern.
+        add_library(juce_clap_headers INTERFACE)
+        target_include_directories(juce_clap_headers INTERFACE
+            "${base_path}/juce_audio_processors_headless/format_types/clap/include")
+        target_link_libraries(juce_audio_processors_headless INTERFACE juce_clap_headers)
+
         if(JUCE_ARG_ALIAS_NAMESPACE)
             add_library(${JUCE_ARG_ALIAS_NAMESPACE}::juce_vst3_headers ALIAS juce_vst3_headers)
             add_library(${JUCE_ARG_ALIAS_NAMESPACE}::juce_lilv_headers ALIAS juce_lilv_headers)
             add_library(${JUCE_ARG_ALIAS_NAMESPACE}::juce_ara_headers ALIAS juce_ara_headers)
+            add_library(${JUCE_ARG_ALIAS_NAMESPACE}::juce_clap_headers ALIAS juce_clap_headers)
         endif()
     endif()
 
