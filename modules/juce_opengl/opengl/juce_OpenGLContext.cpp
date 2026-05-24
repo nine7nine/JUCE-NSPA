@@ -152,8 +152,21 @@ public:
         : context (c),
           component (comp)
     {
+       #if JUCE_WAYLAND && (JUCE_LINUX || JUCE_BSD)
+        // NSPA: runtime-switch native context. WaylandNativeContext inherits
+        // OpenGLContext::NativeContext so the polymorphic interface upstream
+        // OpenGLContext expects works for both protocols without any of the
+        // plugdata opengl_test refactor.
+        if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+            nativeContext.reset (new WaylandNativeContext (component, pixFormat, contextToShare,
+                                                           c.useMultisampling, c.versionRequired));
+        else
+            nativeContext.reset (new NativeContext (component, pixFormat, contextToShare,
+                                                    c.useMultisampling, c.versionRequired));
+       #else
         nativeContext.reset (new NativeContext (component, pixFormat, contextToShare,
                                                 c.useMultisampling, c.versionRequired));
+       #endif
 
         if (nativeContext->createdOk())
             context.nativeContext = nativeContext.get();
@@ -1395,7 +1408,23 @@ bool OpenGLContext::isActive() const noexcept
 
 void OpenGLContext::deactivateCurrentContext()
 {
-    NativeContext::deactivateCurrentContext();
+   #if JUCE_WAYLAND && (JUCE_LINUX || JUCE_BSD)
+    // NSPA: NativeContext::deactivateCurrentContext is static in upstream
+    // (calls glXMakeCurrent against the X11 display); the plugdata-branch
+    // version of this function tried to dispatch polymorphically via
+    // nativeContext->deactivateCurrentContext(), but base-class static
+    // dispatch wins -- the Wayland EGL deactivate never runs. Both
+    // platforms' deactivate paths are functionally static (no per-context
+    // state), so we route directly without going through the base method.
+    if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+    {
+        if (auto display = WaylandEGL::eglGetDisplay (EGL_DEFAULT_DISPLAY))
+            WaylandEGL::eglMakeCurrent (display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
+    else
+   #endif
+        NativeContext::deactivateCurrentContext();
+
     currentThreadActiveContext = nullptr;
 }
 

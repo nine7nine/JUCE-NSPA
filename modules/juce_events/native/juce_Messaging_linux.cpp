@@ -35,6 +35,14 @@
 namespace juce
 {
 
+#if JUCE_WAYLAND
+namespace WaylandMessageLoop
+{
+    void prepareWaylandFd();
+    void processWaylandFd();
+}
+#endif
+
 //==============================================================================
 class InternalMessageQueue
 {
@@ -209,7 +217,17 @@ public:
     bool sleepUntilNextEvent (int timeoutMs)
     {
         const ScopedLock sl (lock);
+       #if JUCE_WAYLAND
+        // Wayland's display fd uses a prepare-read / read-events pattern;
+        // the prepare half must run before poll(), the process half after.
+        // Both are safe no-ops when WaylandWindowSystem isn't initialised.
+        WaylandMessageLoop::prepareWaylandFd();
+        const bool result = poll (pfds.data(), static_cast<nfds_t> (pfds.size()), timeoutMs) != 0;
+        WaylandMessageLoop::processWaylandFd();
+        return result;
+       #else
         return poll (pfds.data(), static_cast<nfds_t> (pfds.size()), timeoutMs) != 0;
+       #endif
     }
 
     std::vector<int> getRegisteredFds()

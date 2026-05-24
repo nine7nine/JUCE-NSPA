@@ -615,11 +615,23 @@ bool LinuxComponentPeer::isActiveApplication = false;
 //==============================================================================
 ComponentPeer* Component::createNewPeer (int styleFlags, void* nativeWindowToAttachTo)
 {
+#if JUCE_WAYLAND
+    if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+        return new WaylandComponentPeer (*this, styleFlags, (WaylandWindow*) nativeWindowToAttachTo);
+#endif
+
     return new LinuxComponentPeer (*this, styleFlags, (::Window) nativeWindowToAttachTo);
 }
 
 //==============================================================================
-JUCE_API bool JUCE_CALLTYPE Process::isForegroundProcess()    { return LinuxComponentPeer::isActiveApplication; }
+JUCE_API bool JUCE_CALLTYPE Process::isForegroundProcess()
+{
+#if JUCE_WAYLAND
+    if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+        return WaylandComponentPeer::isActiveApplication;
+#endif
+    return LinuxComponentPeer::isActiveApplication;
+}
 
 JUCE_API void JUCE_CALLTYPE Process::makeForegroundProcess()  {}
 JUCE_API void JUCE_CALLTYPE Process::hide()                   {}
@@ -633,6 +645,16 @@ void Desktop::setKioskComponent (Component* comp, bool enableOrDisable, bool)
 
 void Displays::findDisplays (const Desktop& desktop)
 {
+#if JUCE_WAYLAND
+    if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+    {
+        displays = WaylandWindowSystem::getInstance()->findDisplays (desktop.getGlobalScaleFactor());
+
+        if (! displays.isEmpty())
+            updateToLogical();
+        return;
+    }
+#endif
     if (XWindowSystem::getInstance()->getDisplay() != nullptr)
     {
         displays = XWindowSystem::getInstance()->findDisplays (desktop.getGlobalScaleFactor());
@@ -644,6 +666,10 @@ void Displays::findDisplays (const Desktop& desktop)
 
 bool Desktop::canUseSemiTransparentWindows() noexcept
 {
+#if JUCE_WAYLAND
+    if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+        return true;
+#endif
     return XWindowSystem::getInstance()->canUseSemiTransparentWindows();
 }
 
@@ -702,6 +728,14 @@ void Desktop::setScreenSaverEnabled (bool isEnabled)
 {
     if (screenSaverAllowed != isEnabled)
     {
+#if JUCE_WAYLAND
+        // Wayland has no equivalent of X11's screensaver protocol; the
+        // idle-inhibit protocol exists but is not wired up here. Tracking
+        // the JUCE state flag would lie about behaviour, so leave it
+        // untouched and no-op.
+        if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+            return;
+#endif
         screenSaverAllowed = isEnabled;
         XWindowSystem::getInstance()->setScreenSaverEnabled (screenSaverAllowed);
     }
@@ -731,22 +765,47 @@ bool detail::MouseInputSourceList::addSource()
 
 bool detail::MouseInputSourceList::canUseTouch() const
 {
+#if JUCE_WAYLAND
+    if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+        return WaylandWindowSystem::getInstance()->isTouchAvailable();
+#endif
     return false;
 }
 
 Point<float> MouseInputSource::getCurrentRawMousePosition()
 {
+#if JUCE_WAYLAND
+    if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+        return WaylandWindowSystem::getInstance()->getCurrentMousePosition();
+#endif
     return Desktop::getInstance().getDisplays().physicalToLogical (XWindowSystem::getInstance()->getCurrentMousePosition());
 }
 
 void MouseInputSource::setRawMousePosition (Point<float> newPosition)
 {
+#if JUCE_WAYLAND
+    // Wayland intentionally does not allow clients to warp the pointer;
+    // there is no protocol equivalent of XWarpPointer. No-op.
+    if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+        return;
+#endif
     XWindowSystem::getInstance()->setMousePosition (Desktop::getInstance().getDisplays().logicalToPhysical (newPosition));
 }
 
 //==============================================================================
 class MouseCursor::PlatformSpecificHandle
 {
+    // NSPA: union'd X11/Wayland cursor handle so the same class serves both
+    // peer types. The wayland field exists only when JUCE_WAYLAND=1, so the
+    // sizeof of this class is unchanged for JUCE_WAYLAND=0 builds.
+    union CursorHandle
+    {
+       #if JUCE_WAYLAND
+        WaylandCursor wayland;
+       #endif
+        Cursor x11;
+    };
+
 public:
     explicit PlatformSpecificHandle (const MouseCursor::StandardCursorType type)
         : cursorHandle (makeHandle (type)) {}
@@ -756,32 +815,66 @@ public:
 
     ~PlatformSpecificHandle()
     {
-        if (cursorHandle != Cursor{})
-            XWindowSystem::getInstance()->deleteMouseCursor (cursorHandle);
+       #if JUCE_WAYLAND
+        if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+        {
+            WaylandWindowSystem::getInstance()->deleteMouseCursor (cursorHandle.wayland);
+            return;
+        }
+       #endif
+        if (cursorHandle.x11 != Cursor{})
+            XWindowSystem::getInstance()->deleteMouseCursor (cursorHandle.x11);
     }
 
     static void showInWindow (PlatformSpecificHandle* handle, ComponentPeer* peer)
     {
-        const auto cursor = handle != nullptr ? handle->cursorHandle : Cursor{};
+       #if JUCE_WAYLAND
+        if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+        {
+            const auto cursor = handle != nullptr ? handle->cursorHandle.wayland : WaylandCursor{ 0, nullptr };
+            WaylandWindowSystem::getInstance()->showCursor (cursor);
+            return;
+        }
+       #endif
+        const auto cursor = handle != nullptr ? handle->cursorHandle.x11 : Cursor{};
 
         if (peer != nullptr)
             XWindowSystem::getInstance()->showCursor ((::Window) peer->getNativeHandle(), cursor);
     }
 
 private:
-    static Cursor makeHandle (const detail::CustomMouseCursorInfo& info)
+    static CursorHandle makeHandle (const detail::CustomMouseCursorInfo& info)
     {
         const auto image = info.image.getImage();
-        return XWindowSystem::getInstance()->createCustomMouseCursorInfo (image.rescaled ((int) (image.getWidth()  / info.image.getScale()),
-                                                                                          (int) (image.getHeight() / info.image.getScale())), info.hotspot);
+        CursorHandle handle;
+       #if JUCE_WAYLAND
+        if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+        {
+            handle.wayland = WaylandWindowSystem::getInstance()->createCustomMouseCursorInfo (image.rescaled ((int) (image.getWidth()  / info.image.getScale()),
+                                                                                                              (int) (image.getHeight() / info.image.getScale())), info.hotspot);
+            return handle;
+        }
+       #endif
+        handle.x11 = XWindowSystem::getInstance()->createCustomMouseCursorInfo (image.rescaled ((int) (image.getWidth()  / info.image.getScale()),
+                                                                                                (int) (image.getHeight() / info.image.getScale())), info.hotspot);
+        return handle;
     }
 
-    static Cursor makeHandle (MouseCursor::StandardCursorType type)
+    static CursorHandle makeHandle (MouseCursor::StandardCursorType type)
     {
-        return XWindowSystem::getInstance()->createStandardMouseCursor (type);
+        CursorHandle handle;
+       #if JUCE_WAYLAND
+        if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
+        {
+            handle.wayland = WaylandWindowSystem::getInstance()->createStandardMouseCursor (type);
+            return handle;
+        }
+       #endif
+        handle.x11 = XWindowSystem::getInstance()->createStandardMouseCursor (type);
+        return handle;
     }
 
-    Cursor cursorHandle;
+    CursorHandle cursorHandle;
 
     //==============================================================================
     JUCE_DECLARE_NON_COPYABLE (PlatformSpecificHandle)

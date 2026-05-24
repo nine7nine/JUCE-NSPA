@@ -180,7 +180,27 @@ private:
     using PtrGLXContext = ScopedGLXObject<TraitsGLXContext>;
     using PtrGLXWindow = ScopedGLXObject<TraitsGLXWindow>;
 
+// NSPA: when JUCE_WAYLAND=1, NativeContext becomes a polymorphic base
+// for WaylandNativeContext to override.  juce_OpenGLContext.cpp calls
+// most methods via the base pointer (createdOk, makeActive, isActive,
+// initialiseOnRenderThread, shutdownOnRenderThread, swapBuffers,
+// setSwapInterval, updateWindowPosition, triggerRepaint, etc.) -- without
+// virtual dispatch the Wayland overrides would never run.  When
+// JUCE_WAYLAND=0 the macro expands to nothing, so the class layout
+// (no vtable) is byte-identical to upstream.  deactivateCurrentContext
+// stays static intentionally; juce_OpenGLContext.cpp's
+// JUCE_WAYLAND-gated branch handles the Wayland case directly.
+#if JUCE_WAYLAND
+ #define NSPA_OPENGL_NC_VIRTUAL virtual
+#else
+ #define NSPA_OPENGL_NC_VIRTUAL
+#endif
+
 public:
+#if JUCE_WAYLAND
+    virtual ~NativeContext() = default;
+#endif
+
     NativeContext (Component& comp,
                    const OpenGLPixelFormat& cPixelFormat,
                    void* shareContext,
@@ -264,6 +284,7 @@ public:
         }
     }
 
+    NSPA_OPENGL_NC_VIRTUAL
     InitResult initialiseOnRenderThread (OpenGLContext& c)
     {
         XWindowSystemUtilities::ScopedXLock xLock;
@@ -322,6 +343,7 @@ public:
         return InitResult::success;
     }
 
+    NSPA_OPENGL_NC_VIRTUAL
     void shutdownOnRenderThread()
     {
         XWindowSystemUtilities::ScopedXLock xLock;
@@ -331,6 +353,7 @@ public:
         glxWindow.reset();
     }
 
+    NSPA_OPENGL_NC_VIRTUAL
     bool makeActive() const noexcept
     {
         XWindowSystemUtilities::ScopedXLock xLock;
@@ -338,6 +361,7 @@ public:
                  && glXMakeContextCurrent (display, glxWindow.get(), glxWindow.get(), renderContext.get());
     }
 
+    NSPA_OPENGL_NC_VIRTUAL
     bool isActive() const noexcept
     {
         XWindowSystemUtilities::ScopedXLock xLock;
@@ -353,11 +377,13 @@ public:
         }
     }
 
+    NSPA_OPENGL_NC_VIRTUAL
     void swapBuffers()
     {
         glXSwapBuffers (display, glxWindow.get());
     }
 
+    NSPA_OPENGL_NC_VIRTUAL
     void updateWindowPosition (Rectangle<int> newBounds)
     {
         bounds = newBounds;
@@ -370,6 +396,7 @@ public:
                                                       (unsigned int) jmax (1, physicalBounds.getHeight()));
     }
 
+    NSPA_OPENGL_NC_VIRTUAL
     bool setSwapInterval (int numFramesPerSwap)
     {
         if (numFramesPerSwap == swapFrames)
@@ -387,11 +414,12 @@ public:
         return false;
     }
 
-    int getSwapInterval() const                 { return swapFrames; }
-    bool createdOk() const noexcept             { return true; }
-    void* getRawContext() const noexcept        { return renderContext.get(); }
-    GLuint getFrameBufferID() const noexcept    { return 0; }
+    NSPA_OPENGL_NC_VIRTUAL int getSwapInterval() const                 { return swapFrames; }
+    NSPA_OPENGL_NC_VIRTUAL bool createdOk() const noexcept             { return true; }
+    NSPA_OPENGL_NC_VIRTUAL void* getRawContext() const noexcept        { return renderContext.get(); }
+    NSPA_OPENGL_NC_VIRTUAL GLuint getFrameBufferID() const noexcept    { return 0; }
 
+    NSPA_OPENGL_NC_VIRTUAL
     void triggerRepaint()
     {
         if (context != nullptr)

@@ -46,6 +46,16 @@ void ComponentDragger::startDraggingComponent (Component* const componentToDrag,
 
     if (componentToDrag != nullptr)
         mouseDownWithinTarget = e.getEventRelativeTo (componentToDrag).getMouseDownPosition();
+
+   #if JUCE_WAYLAND && (JUCE_LINUX || JUCE_BSD)
+    // Wayland clients cannot move themselves; the compositor must drive the
+    // window drag. Hand off via libdecor_frame_move (Wayland session) or
+    // _NET_WM_MOVERESIZE (X11 session under XWayland). Gated on JUCE_WAYLAND
+    // so JUCE_WAYLAND=0 builds keep the legacy in-process drag behaviour.
+    if (componentToDrag != nullptr && componentToDrag->isOnDesktop())
+        if (auto* peer = componentToDrag->getPeer())
+            peer->startHostManagedResize (mouseDownWithinTarget, ResizableBorderComponent::Zone (0));
+   #endif
 }
 
 void ComponentDragger::dragComponent (Component* const componentToDrag, const MouseEvent& e,
