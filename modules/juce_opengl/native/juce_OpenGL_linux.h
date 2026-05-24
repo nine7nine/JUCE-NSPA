@@ -197,9 +197,6 @@ private:
 #endif
 
 public:
-#if JUCE_WAYLAND
-    virtual ~NativeContext() = default;
-#endif
 
     NativeContext (Component& comp,
                    const OpenGLPixelFormat& cPixelFormat,
@@ -259,6 +256,7 @@ public:
         juce_LinuxAddRepaintListener (peer, &dummy);
     }
 
+    NSPA_OPENGL_NC_VIRTUAL
     ~NativeContext()
     {
         if (auto* peer = component.getPeer())
@@ -488,10 +486,17 @@ private:
 };
 
 //==============================================================================
+#if ! JUCE_WAYLAND
+// NSPA: when JUCE_WAYLAND=1, juce_OpenGL_wayland.h provides the
+// wayland-and-X11-aware version of OpenGLHelpers::isContextActive (it
+// runtime-switches between eglGetCurrentContext and glXGetCurrentContext).
+// Gate this X11-only definition out to avoid a redefinition error in the
+// unity translation unit.
 bool OpenGLHelpers::isContextActive()
 {
     XWindowSystemUtilities::ScopedXLock xLock;
     return glXGetCurrentContext() != nullptr;
 }
+#endif
 
 } // namespace juce
