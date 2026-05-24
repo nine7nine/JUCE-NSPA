@@ -96,6 +96,14 @@
     and "freeglut3-dev".
  */
  #include <GL/glx.h>
+ #if JUCE_WAYLAND
+  // EGL provides the context-creation API used by the Wayland backend.
+  // libEGL.so.1 ships with libglvnd on every modern distro (mesa /
+  // nvidia-utils both depend on it), so the system headers are present.
+  #include <EGL/egl.h>
+  #include <EGL/eglext.h>
+  #include <wayland-egl.h>
+ #endif
 
 //==============================================================================
 #elif JUCE_MAC
@@ -286,6 +294,9 @@ JUCE_IMPL_WGL_EXTENSION_FUNCTION (wglCreateContextAttribsARB)
 #elif JUCE_LINUX || JUCE_BSD
  #include <juce_gui_basics/native/juce_ScopedWindowAssociation_linux.h>
  #include "native/juce_OpenGL_linux.h"
+ #if JUCE_WAYLAND
+  #include "native/juce_OpenGL_wayland.h"
+ #endif
 
 #elif JUCE_ANDROID
  #include "native/juce_OpenGL_android.h"

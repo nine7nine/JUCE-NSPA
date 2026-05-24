@@ -158,7 +158,7 @@
 #include "detail/juce_StandardCachedComponentImage.h"
 
 //==============================================================================
-#if JUCE_IOS || JUCE_WINDOWS
+#if JUCE_IOS || JUCE_WINDOWS || (JUCE_WAYLAND && (JUCE_LINUX || JUCE_BSD))
  #include "native/juce_MultiTouchMapper.h"
 #endif
 
@@ -227,6 +227,9 @@
  #include "native/juce_FileChooser_windows.cpp"
 
 #elif JUCE_LINUX || JUCE_BSD
+#if JUCE_WAYLAND
+ #include "native/juce_WaylandSymbols.cpp"
+#endif
  #include "native/juce_XSymbols_linux.cpp"
  #include "native/juce_DragAndDrop_linux.cpp"
 
@@ -234,6 +237,20 @@
 
  #include "native/juce_ScopedWindowAssociation_linux.h"
  #include "native/juce_WindowUtils_linux.cpp"
+#if JUCE_WAYLAND
+ #include "native/juce_Windowing_wayland.cpp"
+#endif
+
+ JUCE_BEGIN_IGNORE_WARNINGS_GCC_LIKE ("-Wc++20-extensions")
+ JUCE_BEGIN_IGNORE_WARNINGS_GCC_LIKE ("-Wmissing-field-initializers")
+
+#if JUCE_WAYLAND
+ #include "native/juce_WaylandWindowSystem.cpp"
+#endif
+
+ JUCE_END_IGNORE_WARNINGS_GCC_LIKE
+ JUCE_END_IGNORE_WARNINGS_GCC_LIKE
+
  #include "native/juce_Windowing_linux.cpp"
  #include "native/juce_NativeMessageBox_linux.cpp"
  #include "native/juce_XWindowSystem_linux.cpp"
