@@ -198,6 +198,22 @@ private:
 
 public:
 
+#if JUCE_WAYLAND
+protected:
+    // NSPA: tag-dispatch constructor used only by WaylandNativeContext
+    // (defined in juce_OpenGL_wayland.h).  Initialises the base reference
+    // member 'component' so its lifetime is sound, but skips ALL X11
+    // setup (no glXChooseFBConfig, no xCreateWindow, no
+    // juce_LinuxAddRepaintListener).  The destructor below checks
+    // x11InitialisedFlag and skips matching X11 cleanup.  Only
+    // declared when JUCE_WAYLAND=1, so JUCE_WAYLAND=0 builds are
+    // byte-identical to upstream.
+    struct NoX11InitTag {};
+    NativeContext (NoX11InitTag, Component& comp)
+        : component (comp), contextToShareWith (nullptr), dummy (*this) {}
+public:
+#endif
+
     NativeContext (Component& comp,
                    const OpenGLPixelFormat& cPixelFormat,
                    void* shareContext,
@@ -254,11 +270,21 @@ public:
         X11Symbols::getInstance()->xSync (display, False);
 
         juce_LinuxAddRepaintListener (peer, &dummy);
+
+       #if JUCE_WAYLAND
+        x11InitialisedFlag = true;
+       #endif
     }
 
     NSPA_OPENGL_NC_VIRTUAL
     ~NativeContext()
     {
+       #if JUCE_WAYLAND
+        // NSPA: skip X11 cleanup for instances created via the
+        // NoX11InitTag protected ctor (i.e. WaylandNativeContext).
+        if (! x11InitialisedFlag)
+            return;
+       #endif
         if (auto* peer = component.getPeer())
         {
             juce_LinuxRemoveRepaintListener (peer, &dummy);
@@ -481,6 +507,13 @@ private:
     DummyComponent dummy;
 
     ::Display* display = nullptr;
+
+   #if JUCE_WAYLAND
+    // NSPA: true once the X11 init path in the 5-arg ctor completed.
+    // The NoX11InitTag ctor leaves this false so the destructor skips
+    // X11 cleanup (used by WaylandNativeContext).
+    bool x11InitialisedFlag = false;
+   #endif
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NativeContext)
 };

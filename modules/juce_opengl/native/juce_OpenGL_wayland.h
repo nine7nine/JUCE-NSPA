@@ -221,7 +221,13 @@ class OpenGLContext::WaylandNativeContext : public OpenGLContext::NativeContext
                           void* shareContext,
                           bool useMultisamplingIn,
                           OpenGLVersion version)
-    : component (comp),
+    // NSPA: route base init through the NoX11InitTag protected ctor so
+    // we inherit the polymorphic interface and the base's 'component'
+    // reference, but skip all X11/GLX setup.  Without this the base's
+    // 5-arg ctor would call XWindowSystem / glXChooseFBConfig /
+    // xCreateWindow against a Wayland peer, which is nonsense.
+    : OpenGLContext::NativeContext (OpenGLContext::NativeContext::NoX11InitTag{}, comp),
+    component (comp),
     contextToShareWith (shareContext),
     versionRequired (version)
     {

@@ -349,6 +349,16 @@ public:
     /** @cond */
     class NativeContext;
     class NativeContextListener;
+   #if JUCE_WAYLAND && (JUCE_LINUX || JUCE_BSD)
+    // NSPA: forward decl for the Wayland-specific subclass defined in
+    // juce_OpenGL_wayland.h.  Required so that `class
+    // OpenGLContext::WaylandNativeContext : public OpenGLContext::NativeContext`
+    // can resolve the qualified name; without it the wayland .h would
+    // fail to define the class.  Only declared when JUCE_WAYLAND=1
+    // (juce_OpenGL_wayland.h isn't included otherwise), so the JUCE
+    // public ABI is unchanged with wayland off.
+    class WaylandNativeContext;
+   #endif
     /** @endcond */
 
 private:
