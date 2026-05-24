@@ -87,6 +87,22 @@ public:
                 t.touchId = 0;
     }
 
+    // NSPA wayland: WaylandWindowSystem.cpp's window-destroy path
+    // iterates current touch indices for a peer to dispatch synthetic
+    // touch-cancel events.  Added in the plugdata wayland-juce8 branch
+    // (commit 32938e36b0 "Wayland: add touch support") on
+    // juce_MultiTouchMapper.h.  Element doesn't use touch but this needs
+    // to be present so juce_WaylandWindowSystem.cpp compiles.
+    std::set<int> getAllTouchIndicesForPeer (ComponentPeer* peer)
+    {
+        std::set<int> touchesForPeer;
+        for (int i = 0; i < currentTouches.size(); i++)
+            if (currentTouches[i].owner == peer)
+                touchesForPeer.insert (i);
+
+        return touchesForPeer;
+    }
+
 private:
     //==============================================================================
     struct TouchInfo
