@@ -126,6 +126,15 @@ extern "C"
      * <windows.h> into the carefully-isolated extern "C" block). */
     constexpr WineUINT  WINE_WM_X11DRV_NSPA_EMBED_WINDOW = 0x80001004u;
 
+    /* wine-nspa wayland counterpart -- defined in
+     * <wine/nspa_wayland_embed.h>.  Makes this HWND's wayland surface a
+     * wl_subsurface of the foreign host wl_surface in WPARAM at the
+     * parent-relative position packed in LPARAM.  Used on all-wayland
+     * sessions instead of the X11 reparent path.  Duplicated here (rather
+     * than #include'd) for the same self-containment reason as the X11
+     * value above. */
+    constexpr WineUINT  WINE_WM_WAYLANDDRV_NSPA_EMBED_WINDOW = 0x80001006u;
+
     WineHMODULE __stdcall GetModuleHandleW (const uint16_t*);
     WineATOM    __stdcall RegisterClassExW (const WineWNDCLASSEXW*);
     WineHWND    __stdcall CreateWindowExW  (WineDWORD exStyle,
@@ -220,6 +229,14 @@ namespace
             return 0;
         return (Window) (uintptr_t) GetPropA (hwnd, kWineX11WholeWindowProp);
     }
+
+    // Pack a parent-relative (x, y) into the LPARAM the wine-nspa embed
+    // messages expect: low 16 bits = (int16_t) x, bits 16..31 = (int16_t) y.
+    WineLPARAM packEmbedPos (int x, int y) noexcept
+    {
+        return (WineLPARAM) ((((unsigned) y & 0xFFFF) << 16)
+                             | ((unsigned) x & 0xFFFF));
+    }
 }
 
 //==============================================================================
@@ -272,7 +289,16 @@ public:
         : ComponentMovementWatcher (&outer),
           owner (outer)
     {
-        display = X11Symbols::getInstance()->xOpenDisplay (nullptr);
+        // All-wayland vs all-X11 is decided per session (no hybrid).  When
+        // wayland is the session display, plugin windows embed via
+        // wl_subsurface on the shared connection and we never touch X11 --
+        // leave `display` null so every X11-specific path below no-ops.
+       #if JUCE_WAYLAND
+        useWayland = WaylandWindowSystem::getInstance()->isWaylandAvailable();
+       #endif
+
+        if (! useWayland)
+            display = X11Symbols::getInstance()->xOpenDisplay (nullptr);
 
         const WineATOM classAtom = ensureWindowClass();
         if (classAtom != 0)
@@ -357,6 +383,12 @@ public:
     // ComponentMovementWatcher overrides
     void componentMovedOrResized (bool /*wasMoved*/, bool /*wasResized*/) override
     {
+        if (useWayland)
+        {
+            syncWaylandBounds();
+            return;
+        }
+
         if (hwnd == nullptr || display == nullptr || wineX11Window == 0)
             return;
 
@@ -396,6 +428,12 @@ public:
 
     void componentPeerChanged() override
     {
+        if (useWayland)
+        {
+            embedWayland();
+            return;
+        }
+
         auto* peer = owner.getPeer();
 
         if (peer == currentPeer)
@@ -479,6 +517,114 @@ public:
     }
 
 private:
+    //==========================================================================
+    // wine-nspa wayland embed path (all-wayland session)
+    // --------------------------------------------------
+    // Much lighter than the X11 path: the JUCE side never touches wayland
+    // protocol directly -- it just hands the host's parent wl_surface* to
+    // winewayland.drv via WM_WAYLANDDRV_NSPA_EMBED_WINDOW, and wine makes the
+    // plugin's surface a wl_subsurface of it.  No display connection, no
+    // reparent, no screen-position polling (a subsurface rides its parent
+    // automatically, so host-window moves need no correction).  Input arrives
+    // through the wayland->winewayland.drv pipeline exactly as the X11 path
+    // gets it through winex11.drv.
+    void embedWayland()
+    {
+        auto* peer = owner.getPeer();
+        if (peer == currentPeer)
+            return;
+
+        currentPeer = peer;
+
+        if (peer == nullptr || hwnd == nullptr)
+            return;
+
+        // Show first so wine allocates win_data + a window surface.  The embed
+        // handler then recreates that surface as a subsurface -- a fresh
+        // surface side-steps the wl_surface "cannot change role" rule.  No
+        // buffer has been committed yet (the host sends this before
+        // IPlugView::attached), so the transient xdg_toplevel never maps.
+        ShowWindow (hwnd, WINE_SW_SHOWNORMAL);
+
+        // WaylandComponentPeer::getNativeHandle() returns the peer's
+        // wl_surface* (cast to void*).
+        void* parentSurface = peer->getNativeHandle();
+
+        auto* topLevel = owner.getTopLevelComponent();
+        auto* peerNow  = topLevel != nullptr ? topLevel->getPeer() : nullptr;
+        const auto area = peerNow != nullptr ? peerNow->getAreaCoveredBy (owner)
+                                             : juce::Rectangle<int> {};
+        const int peerX = area.getX();
+        const int peerY = area.getY();
+        const int w = jmax (1, area.getWidth());
+        const int h = jmax (1, area.getHeight());
+
+        if (parentSurface != nullptr)
+            SendMessageW (hwnd, WINE_WM_WAYLANDDRV_NSPA_EMBED_WINDOW,
+                          (WineWPARAM) parentSurface, packEmbedPos (peerX, peerY));
+
+        lastSyncArea = juce::Rectangle<int> (peerX, peerY, w, h);
+
+        // Drive the plugin's initial WM_SIZE so it paints at the right size;
+        // the subsurface follows the plugin's committed buffer.
+        const WineUINT flags = WINE_SWP_NOMOVE | WINE_SWP_NOZORDER
+                             | WINE_SWP_NOACTIVATE | WINE_SWP_NOOWNERZORDER;
+        SetWindowPos (hwnd, nullptr, 0, 0, w, h, flags);
+
+        RedrawWindow (hwnd, nullptr, nullptr,
+                      WINE_RDW_INVALIDATE | WINE_RDW_ERASE
+                      | WINE_RDW_ALLCHILDREN | WINE_RDW_UPDATENOW);
+    }
+
+    void syncWaylandBounds()
+    {
+        if (hwnd == nullptr)
+            return;
+
+        auto* topLevel = owner.getTopLevelComponent();
+        if (topLevel == nullptr) return;
+        auto* peer = topLevel->getPeer();
+        if (peer == nullptr) return;
+
+        const auto area = peer->getAreaCoveredBy (owner);
+        const int w = jmax (1, area.getWidth());
+        const int h = jmax (1, area.getHeight());
+
+        if (lastSyncArea.getX() == area.getX()
+            && lastSyncArea.getY() == area.getY()
+            && lastSyncArea.getWidth() == w
+            && lastSyncArea.getHeight() == h)
+            return;
+
+        const bool moved = area.getX() != lastSyncArea.getX()
+                        || area.getY() != lastSyncArea.getY();
+
+        lastSyncArea = juce::Rectangle<int> (area.getX(), area.getY(), w, h);
+
+        // Size: drive WM_SIZE so the plugin repaints at the new dimensions.
+        // Position within the parent is owned by wine (set at embed), so we
+        // keep NOMOVE and never feed absolute coords on wayland.
+        const WineUINT flags = WINE_SWP_NOMOVE | WINE_SWP_NOZORDER
+                             | WINE_SWP_NOACTIVATE | WINE_SWP_NOOWNERZORDER;
+        SetWindowPos (hwnd, nullptr, 0, 0, w, h, flags);
+
+        // Position changes (rare -- e.g. a host toolbar toggling) are applied
+        // by re-sending the embed message, which repositions the subsurface.
+        if (moved)
+        {
+            void* parentSurface = currentPeer != nullptr ? currentPeer->getNativeHandle()
+                                                         : nullptr;
+            if (parentSurface != nullptr)
+                SendMessageW (hwnd, WINE_WM_WAYLANDDRV_NSPA_EMBED_WINDOW,
+                              (WineWPARAM) parentSurface,
+                              packEmbedPos (area.getX(), area.getY()));
+
+            RedrawWindow (hwnd, nullptr, nullptr,
+                          WINE_RDW_INVALIDATE | WINE_RDW_ERASE
+                          | WINE_RDW_ALLCHILDREN | WINE_RDW_UPDATENOW);
+        }
+    }
+
     // Tell Wine where wine_x11_window actually IS on screen, then
     // immediately undo the X11-level damage that Wine's SetWindowPos
     // response causes.
@@ -690,6 +836,10 @@ private:
 
     WineHWNDEmbedComponent& owner;
     WineHWND     hwnd          = nullptr;
+    // X11-only state.  On a wayland session display stays null (set in the
+    // ctor), which makes every X11-specific method below no-op; the wayland
+    // path uses embedWayland()/syncWaylandBounds() instead.
+    bool         useWayland    = false;
     Display*     display       = nullptr;
     Window       wineX11Window = 0;
     ComponentPeer* currentPeer = nullptr;
