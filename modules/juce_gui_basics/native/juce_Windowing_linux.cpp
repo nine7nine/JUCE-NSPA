@@ -616,16 +616,7 @@ bool LinuxComponentPeer::isActiveApplication = false;
 ComponentPeer* Component::createNewPeer (int styleFlags, void* nativeWindowToAttachTo)
 {
 #if JUCE_WAYLAND
-    // NSPA: a Component can opt out of Wayland by setting the "nspaForceX11Peer"
-    // named property to true before addToDesktop().  Used by PluginWindow when
-    // it hosts a Wine VST/VST3/CLAP plugin -- WineHWNDEmbedComponent reparents
-    // an X11 Window (the Wine-side winex11.drv backing) under its JUCE peer's
-    // X11 Window via XReparent, which only works when the peer is an X11
-    // LinuxComponentPeer.  Native Element node editors (Sampler / Tracker /
-    // Mandy / etc.) do NOT set the flag and get Wayland peers automatically.
-    const bool forceX11 = getProperties()
-                              .getWithDefault ("nspaForceX11Peer", false);
-    if (! forceX11 && WaylandWindowSystem::getInstance()->isWaylandAvailable())
+    if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
         return new WaylandComponentPeer (*this, styleFlags, (WaylandWindow*) nativeWindowToAttachTo);
 #endif
 

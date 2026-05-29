@@ -76,6 +76,7 @@ public:
     
     wl_display* getDisplay() { return display; }
     wl_compositor* getCompositor() { return compositor; }
+    wl_subcompositor* getSubcompositor() { return subcompositor; }
     wl_shm* getShm() { return shm; }
     
     void grabFocus (WaylandWindow* window);
