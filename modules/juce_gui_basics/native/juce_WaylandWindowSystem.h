@@ -119,10 +119,6 @@ private:
     void updateMouseModifiers (uint32_t button, bool pressed);
     
     wl_display* display;
-    // NSPA: true when `display` was adopted from winewayland.drv (shared
-    // connection for wl_subsurface plugin embedding); wine owns it, so we
-    // must not displayDisconnect it.
-    bool adoptedDisplay = false;
     wl_registry* registry;
     wl_compositor* compositor;
     wl_subcompositor* subcompositor;

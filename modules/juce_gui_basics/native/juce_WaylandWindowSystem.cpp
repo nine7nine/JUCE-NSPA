@@ -4,9 +4,8 @@
  */
 
 #if defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
- #include <cstdint>
+ #include <cstdio>
  #include <cstdlib>
- #include <unistd.h>
 #endif
 
 namespace juce
@@ -143,32 +142,25 @@ WaylandWindowSystem::WaylandWindowSystem()
     if (! xkbContext)
         return;
     
-   #if defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
-    // NSPA: adopt winewayland.drv's wl_display when it published one for THIS
-    // process, so JUCE and the in-process wine plugins share ONE wayland
-    // connection -- the precondition for wl_subsurface plugin embedding (a
-    // subsurface cannot span two clients).  wine is the graphics driver and
-    // connects first, setting WINE_NSPA_WAYLAND_DISPLAY="<pid>:<hexptr>"; we
-    // adopt it when <pid> is ours and fall back to our own connection
-    // otherwise.  See <wine/nspa_wayland_embed.h>.  wine owns an adopted
-    // display, so we must not disconnect it (see dtor).
-    if (const char* nspaEnv = ::getenv ("WINE_NSPA_WAYLAND_DISPLAY"))
-    {
-        char* nspaEnd = nullptr;
-        const long nspaPid = ::strtol (nspaEnv, &nspaEnd, 10);
-        if (nspaEnd != nullptr && *nspaEnd == ':' && nspaPid == (long) ::getpid())
-        {
-            display = (wl_display*) (uintptr_t) ::strtoull (nspaEnd + 1, nullptr, 0);
-            adoptedDisplay = (display != nullptr);
-        }
-    }
-   #endif
-
-    if (! adoptedDisplay)
-        display = WaylandSymbols::getInstance()->displayConnect (nullptr);
+    display = WaylandSymbols::getInstance()->displayConnect (nullptr);
 
     if (! display)
         return;
+
+   #if defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
+    // NSPA: Element OWNS the wayland connection and drives the event loop; the
+    // in-process wine plugins adopt THIS display (precondition for wl_subsurface
+    // embedding -- a subsurface cannot span two clients).  Publish our display
+    // pointer so winewayland.drv (host mode) adopts it on first use, on this
+    // display's DEFAULT queue, which our fd callback below dispatches.  See
+    // <wine/nspa_wayland_embed.h>.  Same process + one libwayland-client.so, so
+    // the pointer is valid across the PE/unix line.
+    {
+        char nspaBuf[32];
+        std::snprintf (nspaBuf, sizeof (nspaBuf), "%p", (void*) display);
+        ::setenv ("WINE_NSPA_WAYLAND_DISPLAY", nspaBuf, 1);
+    }
+   #endif
 
     registry = WaylandSymbols::getInstance()->displayGetRegistry (display);
     if (! registry)
@@ -252,9 +244,31 @@ WaylandWindowSystem::WaylandWindowSystem()
     
     setupDataDeviceCallbacks();
     
-    // Register the event loop callback
-    LinuxEventLoop::registerFdCallback (WaylandSymbols::getInstance()->displayGetFd (display), [](int) mutable {});
-    
+    // Register the event loop callback.  This is the SINGLE reader of the
+    // wayland fd for the whole process: it reads new events and dispatches the
+    // default queue.  Element drives the loop here; in host mode the in-process
+    // wine plugins (winewayland.drv) bind their proxies on this same display's
+    // DEFAULT queue and run no reader thread of their own, so dispatching the
+    // default queue services them too.  Two independent readers on one
+    // wl_display would deadlock -- this keeps it to one.
+    {
+        wl_display* const fdDisplay = display;
+        LinuxEventLoop::registerFdCallback (WaylandSymbols::getInstance()->displayGetFd (fdDisplay),
+            [fdDisplay] (int)
+            {
+                auto* syms = WaylandSymbols::getInstance();
+                // Dispatch anything already queued before preparing to read
+                // (prepare_read fails while events are pending).
+                while (syms->displayPrepareRead (fdDisplay) != 0)
+                    syms->displayDispatchPending (fdDisplay);
+                // The fd is readable -> read new events into their queues...
+                syms->displayReadEvents (fdDisplay);
+                // ...then dispatch the default queue (JUCE + guest/wine proxies).
+                syms->displayDispatchPending (fdDisplay);
+                syms->displayFlush (fdDisplay);
+            });
+    }
+
     initialised = true;
 }
 
@@ -267,9 +281,7 @@ WaylandWindowSystem::~WaylandWindowSystem()
     if (decorator)
         WaylandSymbols::getInstance()->decorUnref (decorator);
     
-    // NSPA: only disconnect a display WE opened; an adopted display is owned
-    // by winewayland.drv.
-    if (display && ! adoptedDisplay)
+    if (display)
         WaylandSymbols::getInstance()->displayDisconnect (display);
     
     WaylandSymbols::deleteInstance();
