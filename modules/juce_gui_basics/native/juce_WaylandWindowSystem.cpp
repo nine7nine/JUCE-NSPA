@@ -428,6 +428,12 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
 
         WaylandSymbols::getInstance()->decorFrameSetCapabilities (window->handle.frame, (libdecor_capabilities)capabilities);
 
+        // wine-nspa: set the xdg_toplevel app_id so the compositor can resolve
+        // the application's .desktop entry (and thus its icon).  JUCE's wayland
+        // peer never set this, so kwin fell back to a generic "W" icon.  Matches
+        // the installed lulada.desktop (Icon=lulada).
+        WaylandSymbols::getInstance()->decorFrameSetAppId (window->handle.frame, "lulada");
+
         WaylandSymbols::getInstance()->decorFrameMap (window->handle.frame);
         WaylandSymbols::getInstance()->surfaceCommit (window->surface);
 

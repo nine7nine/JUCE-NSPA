@@ -233,6 +233,7 @@ bool WaylandSymbols::loadAllSymbols()
                        makeSymbolBinding (decorFrameSetCapabilities,          "libdecor_frame_set_capabilities"),
                        makeSymbolBinding (decorFrameSetVisibility,            "libdecor_frame_set_visibility"),
                        makeSymbolBinding (decorFrameSetTitle,                 "libdecor_frame_set_title"),
+                       makeSymbolBinding (decorFrameSetAppId,                 "libdecor_frame_set_app_id"),
                        makeSymbolBinding (decorFrameSetMinContentSize,        "libdecor_frame_set_min_content_size"),
                        makeSymbolBinding (decorFrameSetMaxContentSize,        "libdecor_frame_set_max_content_size"),
                        makeSymbolBinding (decorFrameMap,                      "libdecor_frame_map"),

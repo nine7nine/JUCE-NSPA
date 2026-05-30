@@ -557,6 +557,10 @@ public:
                                          (libdecor_frame*, const char*),
                                          void)
 
+    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (libdecor_frame_set_app_id, decorFrameSetAppId,
+                                         (libdecor_frame*, const char*),
+                                         void)
+
     JUCE_GENERATE_FUNCTION_WITH_DEFAULT (libdecor_frame_set_min_content_size, decorFrameSetMinContentSize,
                                          (libdecor_frame*, int, int),
                                          void)
