@@ -3,6 +3,12 @@
  // Distributed under the GPLv3 license
  */
 
+#if defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
+ #include <cstdio>
+ #include <cstdlib>
+ #include <unistd.h>
+#endif
+
 namespace juce
 {
 
@@ -140,7 +146,28 @@ WaylandWindowSystem::WaylandWindowSystem()
     display = WaylandSymbols::getInstance()->displayConnect (nullptr);
     if (! display)
         return;
-    
+
+   #if defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
+    // NSPA: publish this wl_display to winewayland.drv so in-process wine
+    // plugins adopt our connection instead of opening their own -- the
+    // precondition for native wl_subsurface plugin embedding (a subsurface
+    // cannot span two wayland clients).  Set here, the instant JUCE connects
+    // (before any wine plugin window loads winewayland.drv), since wine
+    // reads it at driver init.  PID-stamped per the contract in
+    // <wine/nspa_wayland_embed.h> so child wine processes that inherit the
+    // environment fall back to their own wl_display_connect.
+    //
+    // This lives in JUCE (not Element's app code) because WaylandWindowSystem
+    // is a module-internal class -- the wl_display is not reachable from
+    // application code, only from inside juce_gui_basics.
+    {
+        char nspaBuf[64];
+        std::snprintf (nspaBuf, sizeof (nspaBuf), "%ld:%p",
+                       (long) ::getpid(), (void*) display);
+        ::setenv ("WINE_NSPA_WAYLAND_DISPLAY", nspaBuf, 1);
+    }
+   #endif
+
     registry = WaylandSymbols::getInstance()->displayGetRegistry (display);
     if (! registry)
         return;
