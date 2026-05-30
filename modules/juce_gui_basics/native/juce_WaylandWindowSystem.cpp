@@ -244,30 +244,16 @@ WaylandWindowSystem::WaylandWindowSystem()
     
     setupDataDeviceCallbacks();
     
-    // Register the event loop callback.  This is the SINGLE reader of the
-    // wayland fd for the whole process: it reads new events and dispatches the
-    // default queue.  Element drives the loop here; in host mode the in-process
-    // wine plugins (winewayland.drv) bind their proxies on this same display's
-    // DEFAULT queue and run no reader thread of their own, so dispatching the
-    // default queue services them too.  Two independent readers on one
-    // wl_display would deadlock -- this keeps it to one.
-    {
-        wl_display* const fdDisplay = display;
-        LinuxEventLoop::registerFdCallback (WaylandSymbols::getInstance()->displayGetFd (fdDisplay),
-            [fdDisplay] (int)
-            {
-                auto* syms = WaylandSymbols::getInstance();
-                // Dispatch anything already queued before preparing to read
-                // (prepare_read fails while events are pending).
-                while (syms->displayPrepareRead (fdDisplay) != 0)
-                    syms->displayDispatchPending (fdDisplay);
-                // The fd is readable -> read new events into their queues...
-                syms->displayReadEvents (fdDisplay);
-                // ...then dispatch the default queue (JUCE + guest/wine proxies).
-                syms->displayDispatchPending (fdDisplay);
-                syms->displayFlush (fdDisplay);
-            });
-    }
+    // Register the event loop callback.  The actual wayland read is done by
+    // WaylandMessageLoop::prepareWaylandFd()/processWaylandFd() around poll()
+    // in juce_Messaging_linux.cpp (the correct prepare_read-before-poll /
+    // read_events-after-poll pattern, with the pre-poll flush).  That path
+    // dispatches the DEFAULT queue, which also services in-process wine guest
+    // proxies (host mode binds them on the default queue) -- so wine needs no
+    // reader thread.  This callback must therefore stay a no-op: a second
+    // reader here would run prepare_read/read_events a second time per loop and
+    // deadlock the message thread against the prepare/process pair.
+    LinuxEventLoop::registerFdCallback (WaylandSymbols::getInstance()->displayGetFd (display), [](int) {});
 
     initialised = true;
 }
