@@ -280,6 +280,12 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
 {
     auto* window = new WaylandWindow();
     window->peer = dynamic_cast<WaylandComponentPeer*> (peer);
+    // wine-nspa: remember whether a real toplevel was requested.  Helper windows
+    // (GL render surfaces, tooltips) ask for a subsurface; if no parent is
+    // available they fall back to a toplevel below, but they must NOT carry the
+    // application app_id -- otherwise the compositor groups them with the main
+    // window (two taskbar entries, broken minimise toggle).
+    const bool requestedToplevel = ! isSubsurface;
     if (isSubsurface && ! parent)
     {
         window->parentWindow = lastFocusedWindow;
@@ -431,8 +437,11 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
         // wine-nspa: set the xdg_toplevel app_id so the compositor can resolve
         // the application's .desktop entry (and thus its icon).  JUCE's wayland
         // peer never set this, so kwin fell back to a generic "W" icon.  Matches
-        // the installed lulada.desktop (Icon=lulada).
-        WaylandSymbols::getInstance()->decorFrameSetAppId (window->handle.frame, "lulada");
+        // the installed lulada.desktop (Icon=lulada).  Only for real toplevels --
+        // subsurface-fallback helper windows must stay unbranded so they don't
+        // group with the main window in the taskbar.
+        if (requestedToplevel)
+            WaylandSymbols::getInstance()->decorFrameSetAppId (window->handle.frame, "lulada");
 
         WaylandSymbols::getInstance()->decorFrameMap (window->handle.frame);
         WaylandSymbols::getInstance()->surfaceCommit (window->surface);
