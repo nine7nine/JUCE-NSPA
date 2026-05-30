@@ -8,6 +8,8 @@
  #include <cstdlib>
 #endif
 
+#include <poll.h> // wine-nspa: readability check for read_events vs cancel_read
+
 namespace juce
 {
 
@@ -2144,10 +2146,29 @@ void processWaylandFd()
     auto* displayManager = WaylandWindowSystem::getInstance();
     if (! displayManager->isWaylandAvailable())
         return;
-    
+
     auto display = displayManager->getDisplay();
-    WaylandSymbols::getInstance()->displayReadEvents (display);
-    WaylandSymbols::getInstance()->displayDispatchPending (display);
+    auto* syms = WaylandSymbols::getInstance();
+
+    // prepareWaylandFd() registered a read intent via wl_display_prepare_read().
+    // The wayland protocol then requires EXACTLY ONE of read_events()/
+    // cancel_read(): read_events() only if the display fd is actually readable,
+    // otherwise cancel_read().  The previous code always called read_events(),
+    // which blocks the message thread on libwayland's reader-count barrier
+    // whenever poll() woke for a different fd (e.g. a timer posting to the
+    // message pipe) while the GL render thread is also a reader on the shared
+    // connection.  That stalled timer dispatch, so the UI only repainted when
+    // real wayland fd traffic (pointer motion) unblocked the read -- the "main
+    // window freezes unless the cursor moves" bug.  X11 has no prepare_read,
+    // which is why it was wayland-only.
+    struct pollfd pfd { syms->displayGetFd (display), POLLIN, 0 };
+
+    if (poll (&pfd, 1, 0) > 0 && (pfd.revents & POLLIN) != 0)
+        syms->displayReadEvents (display);
+    else
+        syms->displayCancelRead (display);
+
+    syms->displayDispatchPending (display);
 }
 }
 

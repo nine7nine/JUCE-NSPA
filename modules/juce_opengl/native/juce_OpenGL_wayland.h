@@ -445,24 +445,6 @@ class OpenGLContext::WaylandNativeContext : public OpenGLContext::NativeContext
     
     bool setSwapInterval (int numFramesPerSwap)
     {
-        // NSPA: force swap interval 0 on wayland, ignoring the requested value
-        // (JUCE's render thread asks for 1 in initialiseOnThread).
-        //
-        // With vsync (interval >= 1) Mesa's eglSwapBuffers BLOCKS the GL render
-        // thread until a wl_surface frame callback arrives.  On this port the
-        // wayland fd is read only by the message thread (wl_display_prepare_read
-        // before poll() / wl_display_read_events after, in juce_Messaging_linux);
-        // prepare_read is a display-global barrier.  So while the app idles in
-        // poll() the render thread's frame callback is never read off the socket
-        // and rendering freezes until unrelated fd traffic (e.g. pointer motion)
-        // wakes poll() -- the "main window only redraws while the cursor moves"
-        // bug.  Interval 0 makes eglSwapBuffers commit+flush without waiting,
-        // decoupling the render thread from the message thread's fd ownership.
-        // Repaints still pace rendering (continuousRepaint is off on every GL
-        // window, and all timers are <= 60Hz), and the compositor composites
-        // whole frames at its own vblank, so there is no tearing.
-        numFramesPerSwap = 0;
-
         if (numFramesPerSwap == swapFrames)
             return true;
 
