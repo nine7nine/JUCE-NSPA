@@ -4,7 +4,7 @@
  */
 
 #if defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
- #include <cstdio>
+ #include <cstdint>
  #include <cstdlib>
  #include <unistd.h>
 #endif
@@ -143,30 +143,32 @@ WaylandWindowSystem::WaylandWindowSystem()
     if (! xkbContext)
         return;
     
-    display = WaylandSymbols::getInstance()->displayConnect (nullptr);
-    if (! display)
-        return;
-
    #if defined (__WINE__) && (JUCE_LINUX || JUCE_BSD)
-    // NSPA: publish this wl_display to winewayland.drv so in-process wine
-    // plugins adopt our connection instead of opening their own -- the
-    // precondition for native wl_subsurface plugin embedding (a subsurface
-    // cannot span two wayland clients).  Set here, the instant JUCE connects
-    // (before any wine plugin window loads winewayland.drv), since wine
-    // reads it at driver init.  PID-stamped per the contract in
-    // <wine/nspa_wayland_embed.h> so child wine processes that inherit the
-    // environment fall back to their own wl_display_connect.
-    //
-    // This lives in JUCE (not Element's app code) because WaylandWindowSystem
-    // is a module-internal class -- the wl_display is not reachable from
-    // application code, only from inside juce_gui_basics.
+    // NSPA: adopt winewayland.drv's wl_display when it published one for THIS
+    // process, so JUCE and the in-process wine plugins share ONE wayland
+    // connection -- the precondition for wl_subsurface plugin embedding (a
+    // subsurface cannot span two clients).  wine is the graphics driver and
+    // connects first, setting WINE_NSPA_WAYLAND_DISPLAY="<pid>:<hexptr>"; we
+    // adopt it when <pid> is ours and fall back to our own connection
+    // otherwise.  See <wine/nspa_wayland_embed.h>.  wine owns an adopted
+    // display, so we must not disconnect it (see dtor).
+    if (const char* nspaEnv = ::getenv ("WINE_NSPA_WAYLAND_DISPLAY"))
     {
-        char nspaBuf[64];
-        std::snprintf (nspaBuf, sizeof (nspaBuf), "%ld:%p",
-                       (long) ::getpid(), (void*) display);
-        ::setenv ("WINE_NSPA_WAYLAND_DISPLAY", nspaBuf, 1);
+        char* nspaEnd = nullptr;
+        const long nspaPid = ::strtol (nspaEnv, &nspaEnd, 10);
+        if (nspaEnd != nullptr && *nspaEnd == ':' && nspaPid == (long) ::getpid())
+        {
+            display = (wl_display*) (uintptr_t) ::strtoull (nspaEnd + 1, nullptr, 0);
+            adoptedDisplay = (display != nullptr);
+        }
     }
    #endif
+
+    if (! adoptedDisplay)
+        display = WaylandSymbols::getInstance()->displayConnect (nullptr);
+
+    if (! display)
+        return;
 
     registry = WaylandSymbols::getInstance()->displayGetRegistry (display);
     if (! registry)
@@ -265,7 +267,9 @@ WaylandWindowSystem::~WaylandWindowSystem()
     if (decorator)
         WaylandSymbols::getInstance()->decorUnref (decorator);
     
-    if (display)
+    // NSPA: only disconnect a display WE opened; an adopted display is owned
+    // by winewayland.drv.
+    if (display && ! adoptedDisplay)
         WaylandSymbols::getInstance()->displayDisconnect (display);
     
     WaylandSymbols::deleteInstance();
