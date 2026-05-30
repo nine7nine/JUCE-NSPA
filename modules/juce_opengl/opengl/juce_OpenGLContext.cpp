@@ -544,6 +544,14 @@ public:
         invalid.subtract (validArea);
         validArea = currentAreaAndScale.area;
 
+       #if JUCE_WAYLAND
+        // wine-nspa (Finding 1): hand the dirty region to the native context so a
+        // wayland EGL swap can present only the changed rectangles. The full FBO
+        // is still copied to the back buffer every frame (drawComponentBuffer),
+        // so partial damage is purely a compositor hint and never drops pixels.
+        nativeContext->setSwapDamage (invalid, currentAreaAndScale.area.getHeight());
+       #endif
+
         if (! invalid.isEmpty())
         {
             clearRegionInFrameBuffer (invalid);

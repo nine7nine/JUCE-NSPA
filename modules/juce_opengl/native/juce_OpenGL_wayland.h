@@ -30,10 +30,37 @@ struct WaylandEGL
         && loadSymbol (eglLib, "eglDestroyContext", eglDestroyContext)
         && loadSymbol (eglLib, "eglTerminate", eglTerminate)
         && loadSymbol (eglLib, "eglBindAPI", eglBindAPI)
+        && loadSymbol (eglLib, "eglQueryString", eglQueryString)
+        && loadSymbol (eglLib, "eglGetProcAddress", eglGetProcAddress)
         && loadSymbol (eglLib, "eglGetError", eglGetError);
-        
+
         isInitialised = loadedWaylandEgl && loadedEgl;
         return isInitialised;
+    }
+
+    // wine-nspa (Finding 1): resolve eglSwapBuffersWithDamage[EXT|KHR] once, only
+    // if the running EGL display advertises the extension.  Leaving the pointer
+    // null makes swapBuffers() fall back to a plain (full-damage) eglSwapBuffers.
+    static void resolveDamageExtension (EGLDisplay dpy)
+    {
+        if (damageResolved) return;
+        damageResolved = true;
+
+        if (eglQueryString == nullptr || eglGetProcAddress == nullptr)
+            return;
+
+        const char* exts = eglQueryString (dpy, EGL_EXTENSIONS);
+        if (exts == nullptr)
+            return;
+
+        const String e (exts);
+        const char* fn = nullptr;
+        if (e.contains ("EGL_EXT_swap_buffers_with_damage"))      fn = "eglSwapBuffersWithDamageEXT";
+        else if (e.contains ("EGL_KHR_swap_buffers_with_damage")) fn = "eglSwapBuffersWithDamageKHR";
+
+        if (fn != nullptr)
+            eglSwapBuffersWithDamage
+              = reinterpret_cast<EGLBoolean (*) (EGLDisplay, EGLSurface, const EGLint*, EGLint)> (eglGetProcAddress (fn));
     }
     
     static inline wl_egl_window* (*wlWindowCreate) (wl_surface*, int, int) = nullptr;
@@ -55,7 +82,14 @@ struct WaylandEGL
     static inline EGLBoolean (*eglTerminate) (EGLDisplay) = nullptr;
     static inline EGLBoolean (*eglBindAPI) (EGLenum) = nullptr;
     static inline EGLint (*eglGetError) () = nullptr;
-    
+
+    // wine-nspa (Finding 1): damage-aware swap support.
+    using GenericFuncPtr = void (*)();
+    static inline const char* (*eglQueryString) (EGLDisplay, EGLint) = nullptr;
+    static inline GenericFuncPtr (*eglGetProcAddress) (const char*) = nullptr;
+    static inline EGLBoolean (*eglSwapBuffersWithDamage) (EGLDisplay, EGLSurface, const EGLint*, EGLint) = nullptr;
+    static inline bool damageResolved = false;
+
     private:
     template <typename Func>
     static bool loadSymbol (juce::DynamicLibrary& lib, const char* name, Func& out)
@@ -371,7 +405,8 @@ class OpenGLContext::WaylandNativeContext : public OpenGLContext::NativeContext
         
         context = &c;
         WaylandEGL::eglSwapInterval (eglDisplay, 0);
-        
+        WaylandEGL::resolveDamageExtension (eglDisplay);
+
         return InitResult::success;
     }
     
@@ -414,7 +449,44 @@ class OpenGLContext::WaylandNativeContext : public OpenGLContext::NativeContext
     {
         if (eglSurface == PtrEGLSurface{} || waylandSurface == nullptr)
             return;
-        WaylandEGL::eglSwapBuffers (eglDisplay, eglSurface.get());
+
+        // wine-nspa (Finding 1): if the last paint reported a damage region and
+        // the extension is present, present only the changed rectangles so the
+        // compositor recomposites just that area instead of the whole window.
+        // Falls back to a full swap when there is no damage (consume-and-clear
+        // below guarantees a frame that swapped without a fresh paint is full).
+        if (hasSwapDamage && WaylandEGL::eglSwapBuffersWithDamage != nullptr && ! swapDamageRects.empty())
+            WaylandEGL::eglSwapBuffersWithDamage (eglDisplay, eglSurface.get(),
+                                                  swapDamageRects.data(),
+                                                  (EGLint) (swapDamageRects.size() / 4));
+        else
+            WaylandEGL::eglSwapBuffers (eglDisplay, eglSurface.get());
+
+        hasSwapDamage = false;
+    }
+
+    // wine-nspa (Finding 1): receive the dirty region computed by the GL
+    // CachedImage just before the swap.  invalid is in physical/buffer pixels
+    // with a top-left origin; EGL damage rects are buffer pixels with a
+    // bottom-left origin, so flip Y against the surface height.  Empty/absent
+    // damage leaves hasSwapDamage false -> swapBuffers() does a full swap.
+    void setSwapDamage (const RectangleList<int>& invalid, int surfaceHeightPx) override
+    {
+        swapDamageRects.clear();
+        hasSwapDamage = false;
+
+        if (WaylandEGL::eglSwapBuffersWithDamage == nullptr || invalid.isEmpty())
+            return;
+
+        for (auto& r : invalid)
+        {
+            swapDamageRects.push_back (r.getX());
+            swapDamageRects.push_back (surfaceHeightPx - (r.getY() + r.getHeight()));
+            swapDamageRects.push_back (r.getWidth());
+            swapDamageRects.push_back (r.getHeight());
+        }
+
+        hasSwapDamage = ! swapDamageRects.empty();
     }
     
     void updateWindowPosition (Rectangle<int> newBounds)
@@ -514,6 +586,8 @@ class OpenGLContext::WaylandNativeContext : public OpenGLContext::NativeContext
     wl_egl_window* waylandEglWindow = nullptr;
     
     int swapFrames = 0;
+    std::vector<EGLint> swapDamageRects; // wine-nspa (Finding 1): flipped EGL damage quads for the next swap
+    bool hasSwapDamage = false;
     Rectangle<int> bounds;
     void* contextToShareWith;
     OpenGLVersion versionRequired;

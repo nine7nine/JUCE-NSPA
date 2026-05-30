@@ -443,6 +443,12 @@ public:
     NSPA_OPENGL_NC_VIRTUAL void* getRawContext() const noexcept        { return renderContext.get(); }
     NSPA_OPENGL_NC_VIRTUAL GLuint getFrameBufferID() const noexcept    { return 0; }
 
+    // wine-nspa (Finding 1): GLX presents the whole drawable; no damage hint.
+    // The wayland NativeContext overrides this to record the dirty region for
+    // eglSwapBuffersWithDamage. No-op here so the cross-platform CachedImage can
+    // call it unconditionally on Linux/BSD.
+    NSPA_OPENGL_NC_VIRTUAL void setSwapDamage (const RectangleList<int>&, int) {}
+
     NSPA_OPENGL_NC_VIRTUAL
     void triggerRepaint()
     {
